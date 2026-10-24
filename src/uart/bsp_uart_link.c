@@ -8,7 +8,7 @@
 #include "rtt/rtt_log.h"
 #include "usb/bsp_usb_cdc.h"        /* USB_CDC_Write: 身份应答走 Type-C 回 */
 
-/* 固件版本魔数（在 nt7534_test.c 里写入, 这里只读低 8 位）。
+/* 固件版本魔数（在 nt7534.c 里写入, 这里只读低 8 位）。
  * 用 extern 而不是 include 那个头: 保持 uart 层不依赖 nt7534, 且版本只有一处真值。 */
 extern volatile uint32_t g_nt_fw_tag;
 

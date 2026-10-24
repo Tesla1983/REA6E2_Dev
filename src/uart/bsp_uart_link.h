@@ -73,7 +73,7 @@ const uart_link_data_t * UART_Link_Data(void);
  *  把本宏置 1, 固件每秒从 TX 发一行 `BEACON <n>\r\n`; 电脑上逐个 COM 口去听,
  *  哪个口能听到 ⇒ 那个口与本板是连着的, 顺带证明波特率和引脚复用都对。
  *
- *  调用点在 `src/nt7534/nt7534_test.c` 的主循环里, 收本宏控制。 */
+ *  调用点在 `src/nt7534/nt7534.c` 的主循环里, 收本宏控制。 */
 #define UART_LINK_BEACON    (1)
 
 /** 从 TX 发一行 `BEACON <n>\r\n`（阻塞发送, 约 1 ms）。仅在排查连线时调用。 */

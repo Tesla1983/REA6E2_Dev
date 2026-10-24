@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """把方案 A 的界面从"手写绘图 API"切到 u8g2。
 
-只改 src/nt7534/nt7534_test.c 里两段:
+只改 src/nt7534/nt7534.c 里两段:
   - build_metric_line + draw_layout_a  ->  用 U8G2_PORT_ENABLE 分成新旧两套
   - 固件版本号 v5 -> v6
 旧的 fmt2/fmt4 保留（新路径也用，作为定长数字格式化）。
@@ -9,7 +9,7 @@
 import io
 import sys
 
-P = 'src/nt7534/nt7534_test.c'
+P = 'src/nt7534/nt7534.c'
 s = io.open(P, encoding='utf-8').read()
 
 START = "/** 拼\"标签 + 温度℃ + 占用% + 风扇\"一行"

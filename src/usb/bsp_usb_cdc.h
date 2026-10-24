@@ -84,7 +84,7 @@ void USB_CDC_ProbeUpdate(void);
  *  ISR 只把事件解码进深度仅 8 的环形缓冲, 派发靠 `usb_pstd_pcd_task()`。
  *  不调 ⇒ 枚举卡在 Address; 调得太稀 ⇒ 缓冲溢出丢事件;
  *  放到 ISR 里调 ⇒ FSP 的类请求 API 会被在中断上下文调用, 主机 SetCommState 超时。
- *  调用点见 nt7534_test.c 主循环里的 2 ms 细片。 */
+ *  调用点见 nt7534.c 主循环里的 2 ms 细片。 */
 void USB_CDC_Poll(void);
 
 #endif /* BSP_USB_CDC_H_ */

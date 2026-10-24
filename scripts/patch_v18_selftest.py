@@ -5,8 +5,8 @@
 """
 import io
 
-C_FILE = "src/nt7534/nt7534_test.c"
-H_FILE = "src/nt7534/nt7534_test.h"
+C_FILE = "src/nt7534/nt7534.c"
+H_FILE = "src/nt7534/nt7534.h"
 
 BLOCK = r'''/* ============================================================
  * 屏幕自检（v18 起改为**宏开关**：NT7534_SELFTEST，默认 0 = 关闭）
@@ -16,7 +16,7 @@ BLOCK = r'''/* ============================================================
  * 3.5" 屏的显示部分已验收完毕（版面 A + linked/unlink 稳定），
  * 所以自检改成"排查时才打开"的开关。
  *
- * 打开方式：`nt7534_test.h` 里把 `NT7534_SELFTEST` 置 1。
+ * 打开方式：`nt7534.h` 里把 `NT7534_SELFTEST` 置 1。
  * 打开后开机流程 = 探线 → Init → 5 段画面（每段停 2~4 s）→ 进主循环。
  * ============================================================ */
 
@@ -210,7 +210,7 @@ static void nt_selftest_run(void)
 
 s = io.open(C_FILE, encoding="utf-8").read()
 
-anchor = "void NT7534_TestRun(void)"
+anchor = "void NT7534_Run(void)"
 assert anchor in s
 s = s.replace(anchor, BLOCK + anchor, 1)
 

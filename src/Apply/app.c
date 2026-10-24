@@ -23,7 +23,7 @@
 #include "rtt/rtt_log.h"
 #include "rtt/itm_log.h"
 #include "Ascii/xjp.h"
-#include "nt7534/nt7534_test.h"
+#include "nt7534/nt7534.h"
 
 /* ★★★ 启动目标选择 ★★★
  *   1 = 3.5" NT7534 屏（接线自检 6 幕 + 方案A 演示）
@@ -81,7 +81,7 @@ void Run (void)
 
 #if APP_USE_NT7534_3IN5
     /* 3.5" 屏: 先自检接线, 再依次放 6 个画面, 最后停在方案A。内部死循环, 不返回。 */
-    NT7534_TestRun();
+    NT7534_Run();
 #endif
 
     ITM_Init();                       /* 打通 ITM -> Funnel -> TMC/ETF */

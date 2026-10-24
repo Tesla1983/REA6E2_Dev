@@ -5,7 +5,7 @@
 """
 import io
 
-P = "src/nt7534/nt7534_test.c"
+P = "src/nt7534/nt7534.c"
 s = io.open(P, encoding="utf-8").read()
 
 START = "    /* \u2b50 v17: **USB / \u4e32\u53e3\u94fe\u8def\u63d0\u5230\u5c4f\u5e55\u81ea\u68c0\u4e4b\u524d\u521d\u59cb\u5316**\u3002"

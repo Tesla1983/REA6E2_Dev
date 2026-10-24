@@ -1,9 +1,9 @@
 /* ============================================================
  * 3.5" 屏接线自检 + 方案A 演示实现
- * 说明见 nt7534_test.h
+ * 说明见 nt7534.h
  * ============================================================ */
 
-#include "nt7534/nt7534_test.h"
+#include "nt7534/nt7534.h"
 #include "tsn/bsp_tsn.h"             /* RA6E2 片上温度传感器（1.3" OLED 显示结温） */
 
 #include <stdio.h>
@@ -31,7 +31,7 @@ static bool s_oled_ok = false;
 /** 方案 A 累计帧号。画在状态行上: 数字在跳 = 屏在实时刷新, 不是残留图像。 */
 static uint16_t s_frame_no = 0u;
 
-/** 固件版本标记, 见 nt7534_test.h */
+/** 固件版本标记, 见 nt7534.h */
 volatile uint32_t g_nt_fw_tag = 0u;
 
 /** OLED 行距。字体是 8x16（见 oled_font.h 的 OLED_FONT_W/H）⇒
@@ -320,7 +320,7 @@ static void draw_layout_a(void)
  * 3.5" 屏的显示部分已验收完毕（版面 A + linked/unlink 稳定），
  * 所以自检改成"排查时才打开"的开关。
  *
- * 打开方式：`nt7534_test.h` 里把 `NT7534_SELFTEST` 置 1。
+ * 打开方式：`nt7534.h` 里把 `NT7534_SELFTEST` 置 1。
  * 打开后开机流程 = 探线 → Init → 5 段画面（每段停 2~4 s）→ 进主循环。
  * ============================================================ */
 
@@ -510,7 +510,7 @@ static void nt_selftest_run(void)
 
 #endif /* (0 != NT7534_SELFTEST) */
 
-void NT7534_TestRun(void)
+void NT7534_Run(void)
 {
     led_init();
 

@@ -6,7 +6,7 @@
 import io
 import re
 
-P = "src/nt7534/nt7534_test.c"
+P = "src/nt7534/nt7534.c"
 s = io.open(P, encoding="utf-8").read()
 
 TARGETS = [

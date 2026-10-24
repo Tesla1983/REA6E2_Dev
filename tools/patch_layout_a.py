@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""重写 nt7534_test.c 的方案A布局与主循环（一次性工具脚本）。"""
+"""重写 nt7534.c 的方案A布局与主循环（一次性工具脚本）。"""
 import io
 
-P = 'src/nt7534/nt7534_test.c'
+P = 'src/nt7534/nt7534.c'
 s = io.open(P, encoding='utf-8').read()
 
 NEW_LAYOUT = '''#if (0 != NT7534_OFFSET_SWEEP)
