@@ -4,6 +4,7 @@
  * ============================================================ */
 
 #include "nt7534/nt7534_test.h"
+#include "tsn/bsp_tsn.h"             /* RA6E2 片上温度传感器（1.3" OLED 显示结温） */
 
 #include <stdio.h>
 
@@ -550,6 +551,13 @@ void NT7534_TestRun(void)
     /* 1.3" OLED 只当"第二指示灯"：3.5" 屏黑屏时，它上面有字就说明 MCU 起来了。 */
     s_oled_ok = (FSP_SUCCESS == OLED_Init());
 
+    /* 1.3" OLED 还要显示 RA6E2 芯片结温，先开 TSN（失败不影响 3.5" 屏，仅 RTT 告警）。 */
+    {
+        fsp_err_t terr = TSN_Init();
+        RTT_Printf("TSN_Init -> err=%d, cal=%u, slope=%d uV/C\n",
+                   (int) terr, (unsigned) g_tsn_calib, (int) g_tsn_slope);
+    }
+
 #if (0 != NT7534_SELFTEST)
     /* 自检模式：探线 + Init + 5 段画面（返回后进主循环画版面 A） */
     nt_selftest_run();
@@ -575,6 +583,24 @@ void NT7534_TestRun(void)
         s_frame_no++;
         USB_CDC_ProbeUpdate();
         draw_layout_a();
+
+        /* 1.3" OLED：显示 RA6E2 芯片结温（与 3.5" 屏上位机数据并行）。
+         *   每轮（约 1 s）清屏重画一次，整屏 1 Hz 刷新。 */
+        {
+            int32_t t = 0;
+            if (FSP_SUCCESS == TSN_ReadTemperature(&t))
+            {
+                char tl[24];
+                (void) snprintf(tl, sizeof(tl), "T=%ld.%ld C",
+                                (long) (t / 10),
+                                (long) ((t < 0) ? (-(t % 10)) : (t % 10)));
+                OLED_Clear();
+                OLED_DrawString(0, 0, "RA6E2 CHIP T");
+                OLED_DrawString(0, 16, tl);
+                OLED_DrawString(0, 32, "TSN->ADC12(-3)");
+                OLED_Refresh();
+            }
+        }
 
         if (0u == (uint32_t) (s_frame_no % 15u))
         {
