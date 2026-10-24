@@ -1,0 +1,109 @@
+{
+  "_readme": [
+    "板子身份登记表 —— 唯一的板子身份真值来源。",
+    "规则：只认【不可变身份】= USB VID:PID + 序列号，或芯片 UID。",
+    "      **绝不允许用 COM 号识别板子** —— COM 号每次枚举都可能变",
+    "      （Pico 的 CDC 从 COM4 变成过 COM14，就是这个坑）。",
+    "用法：python tools/board_id.py          # 列出当前插着的板子及其归属",
+    "      python tools/board_id.py --require ra6e2-dqx   # 烧录前的硬闸门",
+    "维护：新板子入册时必须填 owning_project，跨项目借用要在 allowed_in 里显式列明。"
+  ],
+  "boards": [
+    {
+      "id": "ra6e2-dqx",
+      "label": "立创·地奇星 RA6E2（R7FA6E2BB3CNE / QFN48）",
+      "owning_project": "E:/REA6E2_Dev",
+      "role": "target",
+      "identity": {
+        "usb": {
+          "vid": "045b",
+          "pid": "0263",
+          "serial": "0000000000001"
+        },
+        "chip_uid": "43045a7635333832612a45534e4b2eb4"
+      },
+      "identity_note": "USB 序列号是 FSP 模板里写死的 0000000000001，**不唯一**，不能当身份。真身份用芯片 UID：probe-rs read --chip R7FA6E2BB b32 0x01008190 4（BSP_FEATURE_BSP_UNIQUE_ID_POINTER）",
+      "firmware": "build/ra6e2_fw.elf",
+      "allowed_in": ["E:/REA6E2_Dev"]
+    },
+    {
+      "id": "rp2350-pico2-imu",
+      "label": "RP2350（Pico 2）+ MPU6500 IMU 板",
+      "owning_project": "E:/RP2350_Dev",
+      "role": "target（另一个项目的目标板）",
+      "identity": {
+        "usb": [
+          {
+            "_firmware": "IMU 固件（2026-10-23 已还原，当前状态）",
+            "vid": "2e8a",
+            "pid": "0009",
+            "serial": "BAD9F7B2EDDE496E"
+          },
+          {
+            "_firmware": "debugprobe v2.3.1（★ 事故状态，不该出现）",
+            "vid": "2e8a",
+            "pid": "000c",
+            "serial": "BAD9F7B2EDDE496E"
+          }
+        ]
+      },
+      "identity_note": "**序列号是芯片 flash unique ID，跨固件重刷完全不变** —— 这正是它适合当身份的原因：同一个 BAD9F7B2EDDE496E 在 IMU 固件下是 2e8a:0009、在 debugprobe 下是 2e8a:000c。⚠ 而 COM 号会跟着变（COM14 → COM4），再次证明 COM 号不能当身份。",
+      "current_firmware": "IMU 固件（Board CDC, 2e8a:0009）—— 2026-10-23 已从 debugprobe 还原",
+      "restore_firmware": "E:/RP2350_Dev/rp2350+mpu6500/build/rp2350_mpu6500.uf2",
+      "allowed_in": ["E:/RP2350_Dev"]
+    },
+    {
+      "id": "daplink-0d28",
+      "label": "DAPLink 探针（CMSIS-DAP v1，Interface 0253，Local Mods 1）",
+      "owning_project": "E:/REA6E2_Dev",
+      "role": "probe",
+      "identity": {
+        "usb": {
+          "vid": "0d28",
+          "pid": "0204",
+          "serial": "0700000102620220523200063638414ba5a5a5a597969908"
+        }
+      },
+      "identity_note": "序列号含芯片唯一 ID，稳定。F:/DETAILS.TXT 的 Unique ID 与之一致（大写）。",
+      "status": "dead",
+      "status_note": "2026-10-23 下午起 HID 命令引擎不响应（`probe-rs list` 仍能枚举，但 DAP_Info 零应答）。上午曾靠『拔 USB 等满 30 s』救回一次，下午同样操作 4 次无效，且 ASSERT.TXT 不再重建 ⇒ 不是队列满，是主循环／HID 接收环死。无按键 ⇒ 进不了 MAINTENANCE；Local Mods:1 又不能刷通用固件。",
+      "revive_steps": [
+        "拔掉探针上所有线（3V3/GND/SWCLK/SWDIO），USB 也拔，等满 30 秒，只插 USB",
+        "判据：F:/ 无 ASSERT.TXT **且** python tools/daplink_probe.py 报 6/6",
+        "仍不行 ⇒ 只能换探针（把 RP2350 临时刷成 debugprobe，用完还原）"
+      ],
+      "allowed_in": ["E:/REA6E2_Dev"]
+    },
+    {
+      "id": "esp32s3-builtin",
+      "label": "ESP32-S3 内置 USB-JTAG（只能烧 ESP，没有 RA6E2 flash 算法）",
+      "owning_project": "（其他项目）",
+      "role": "probe（仅 ESP）",
+      "identity": {
+        "usb": {
+          "vid": "303a",
+          "pid": "1001",
+          "serial": "1C:DB:D4:99:5B:F8"
+        }
+      },
+      "identity_note": "序列号是芯片 MAC。",
+      "allowed_in": []
+    },
+    {
+      "id": "stm32h743-ttl",
+      "label": "STM32H743VIT6 开发板外挂的 CH340 USB-TTL（COM9）",
+      "owning_project": "（其他项目，与本项目无关）",
+      "role": "无关设备",
+      "identity": {
+        "usb": {
+          "vid": "1a86",
+          "pid": "7523",
+          "serial": null
+        }
+      },
+      "identity_note": "CH340 是 USB-TTL 串口芯片，**不是** STM32 自带的 USB。用户在 2026-10-23 明确交代：与本项目无关，不要动。",
+      "allowed_in": [],
+      "do_not_touch": true
+    }
+  ]
+}

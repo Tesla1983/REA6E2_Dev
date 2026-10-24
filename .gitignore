@@ -1,0 +1,24 @@
+# ===== 固件构建产物 =====
+build/
+build58/
+*.o
+*.elf
+*.map
+*.bin
+*.lst
+*.su
+*.d
+
+# ===== Rust GUI 构建产物 =====
+/gui/target/
+/gui/.shots/
+
+# ===== IDE / 工具链元数据 (Eclipse / E2 Studio) =====
+.metadata/
+
+# ===== 调试中间产物 (screen_shot.py 等生成) =====
+fb.hex
+fb_ascii.txt
+
+# ===== 工具 / agent 项目数据 =====
+.workbuddy/

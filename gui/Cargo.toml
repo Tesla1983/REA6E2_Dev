@@ -1,0 +1,15 @@
+[package]
+name = "ra6e2-monitor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# glow（OpenGL）而不是默认的 wgpu：
+#   默认 features 带 wgpu，启动时异步建 surface，在本机（Intel Arc A770 / D3D12）
+#   首帧前后会整窗闪一下。glow 是同步的、更轻，启动稳。
+#   保留默认 features ⇒ wgpu 仍在，随时可把 Renderer::Glow 改回 Wgpu 一行回退。
+eframe = { version = "0.37.0", features = ["glow"] }
+serde_json = "1.0.154"
+serialport = "4.10.1"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Performance", "Win32_System_SystemInformation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_System_Threading"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }

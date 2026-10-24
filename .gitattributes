@@ -1,0 +1,13 @@
+# 统一行尾为 LF：本项目在 Git Bash + Linux 风格工具链(RASC/CMake/ninja)下构建，
+# 使用 LF 可避免 Windows CRLF 造成的 diff 噪声与潜在解析问题。
+* text=auto eol=lf
+
+# 二进制资源：不转换、不计算 diff 文本
+*.ttf  binary
+*.otf  binary
+*.bmp  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.ico  binary
+*.gif  binary

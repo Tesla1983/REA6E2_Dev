@@ -1,0 +1,11 @@
+################################################################################
+# Automatically-generated file. Do not edit!
+################################################################################
+
+arg1 = $(1)
+export PATH=D:\studio\toolchains\gcc_arm\13.2.rel1\bin\;D:\studio\eclipse\plugins\com.renesas.ide.exttools.busybox.win32.x86_64_1.3.6.v20230615-0931\bin\;D:\studio\eclipse\plugins\com.renesas.ide.exttools.gnumake.win32.x86_64_4.3.1.v20240909-0854\mk\;D:\studio\eclipse\plugins\com.renesas.ide.exttools.scandep.win32.x86_64_1.0.0.v20230915-1033\sd\;D:/studio/eclipse//plugins/org.eclipse.justj.openjdk.hotspot.jre.full.win32.x86_64_21.0.4.v20240802-1551/jre/bin/server;D:/studio/eclipse//plugins/org.eclipse.justj.openjdk.hotspot.jre.full.win32.x86_64_21.0.4.v20240802-1551/jre/bin;C:\Users\Administrator\AppData\Local\Programs\Python\Python39\Scripts;D:\VM\bin\;C:\windows\system32;C:\windows;C:\windows\System32\Wbem;C:\windows\System32\WindowsPowerShell\v1.0\;C:\windows\System32\OpenSSH\;D:\Node\;D:\Git\Git\cmd;C:\Program Files\dotnet\;D:\STM32\vscode_stm32\w64devkit\bin\;D:\STM32\vscode_arm\13.3 rel1\bin;D:\STM32\OpenOCD-20230712-0.12.0\bin;D:\STM32\jdk\bin;C:\Program Files (x86)\sbt\bin;C:\Program Files (x86)\scala\bin;C:\Users\Administrator\AppData\Local\Programs\Python\Python39\Scripts;C:\Users\Administrator\AppData\Local\Programs\Python\Python39\Scripts\;C:\Users\Administrator\AppData\Local\Programs\Python\Python39\;C:\Users\Administrator\AppData\Local\Microsoft\WindowsApps;D:\VSCODE\Microsoft VS Code\bin;C:\Users\Administrator\AppData\Roaming\npm;D:\Moldeism\win64;;D:\studio\eclipse
+export TCINSTALL=D:\studio\toolchains\gcc_arm\13.2.rel1$(call arg1,\)
+export CWD=$(CURDIR)
+export TC_VERSION=13.2.1.arm-13-7
+export PWD=$(CURDIR)
+export GCC_VERSION=13.2.1
