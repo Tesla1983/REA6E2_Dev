@@ -34,6 +34,8 @@ pub struct Mask {
     pub gpu_temp: bool,
     pub gpu_load: bool,
     pub gpu_fan: bool,
+    /// 显存占用率（协议 key `GV`）。**默认不勾**（屏上暂不显示，只在上位机看）。
+    pub gpu_vram: bool,
     pub mem: bool,
 }
 
@@ -48,6 +50,7 @@ impl Default for Mask {
             gpu_temp: true,
             gpu_load: true,
             gpu_fan: true,
+            gpu_vram: false,
             mem: true,
         }
     }
@@ -63,6 +66,7 @@ impl Mask {
             (self.gpu_group && self.gpu_temp, "GT"),
             (self.gpu_group && self.gpu_load, "GU"),
             (self.gpu_group && self.gpu_fan, "GF"),
+            (self.gpu_group && self.gpu_vram, "GV"),
             (self.mem, "MU"),
         ]
     }
@@ -760,6 +764,9 @@ impl App {
                     ui.add_space(10.0);
                     ui.checkbox(&mut self.mask.gpu_fan, "风扇");
                     ui.label(egui::RichText::new(fmt(sample.gf_display, sample.gf_unit.suffix())).size(11.0).monospace().weak());
+                    ui.add_space(10.0);
+                    ui.checkbox(&mut self.mask.gpu_vram, "显存");
+                    ui.label(egui::RichText::new(fmt(sample.gv, "%")).size(11.0).monospace().weak());
                 });
             });
         });

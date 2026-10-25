@@ -29,6 +29,8 @@ pub struct Sample {
     pub gu: Option<i32>,
     pub gf: Option<i32>,
     pub mu: Option<i32>,
+    /// 显存占用率（%）。协议 key = `GV`；固件 v24 不认这个 key（忽略），屏上暂不显示。
+    pub gv: Option<i32>,
     /// 风扇值的原始单位（只影响 UI 后缀显示）
     pub cf_unit: FanUnit,
     pub gf_unit: FanUnit,
@@ -112,6 +114,7 @@ impl Sample {
             "GU" => self.gu,
             "GF" => self.gf,
             "MU" => self.mu,
+            "GV" => self.gv,
             _ => None,
         }
     }
@@ -569,6 +572,92 @@ pub fn pick_primary_adapter(list: &[AdapterInfo]) -> Option<&AdapterInfo> {
         .max_by_key(|a| a.dedicated_vram)
 }
 
+/// 取某张 DXGI 适配器的**专用显存规格**（字节），用作占用率的分母。
+pub fn adapter_dedicated_vram(adapter_index: u32) -> Option<u64> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let ad = factory.EnumAdapters1(adapter_index).ok()?;
+        let desc = ad.GetDesc1().ok()?;
+        Some(desc.DedicatedVideoMemory as u64)
+    }
+}
+
+/// 整机显存占用（字节）：PDH `\GPU Adapter Memory(*)\Dedicated Usage`。
+///
+/// ⚠ **别用 DXGI `QueryVideoMemoryInfo`**：它返回的是**本进程**的预算/用量（实测监控程序
+/// 恒为 0%），不是整机占用。PDH 这个计数器才是任务管理器同源的口径，且厂商无关。
+/// 实例名形如 `luid_0x00000000_0x00011ce4_phys_0`，按 LUID 片段挑目标卡。
+pub struct GpuVram {
+    query: isize,
+    counter: isize,
+    luid_tag: String,
+}
+
+impl GpuVram {
+    pub fn new(luid_tag: &str) -> Option<Self> {
+        let mut query: isize = 0;
+        let mut counter: isize = 0;
+        let path = wide(r"\GPU Adapter Memory(*)\Dedicated Usage");
+        unsafe {
+            if PdhOpenQueryW(std::ptr::null(), 0, &mut query) != 0 {
+                return None;
+            }
+            if PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut counter) != 0 {
+                return None;
+            }
+            let _ = PdhCollectQueryData(query);
+        }
+        Some(Self {
+            query,
+            counter,
+            luid_tag: luid_tag.to_string(),
+        })
+    }
+
+    /// 当前专用显存占用（字节）。这是即时值（rawcount），不需要两次采集。
+    pub fn used_bytes(&mut self) -> Option<u64> {
+        unsafe {
+            if PdhCollectQueryData(self.query) != 0 {
+                return None;
+            }
+            let mut size: u32 = 0;
+            let mut count: u32 = 0;
+            let mut rc = PdhGetFormattedCounterArrayW(
+                self.counter, PDH_FMT_DOUBLE, &mut size, &mut count, std::ptr::null_mut(),
+            );
+            if rc != PDH_MORE_DATA || size == 0 {
+                return None;
+            }
+            let mut buf = vec![0u8; size as usize];
+            rc = PdhGetFormattedCounterArrayW(
+                self.counter,
+                PDH_FMT_DOUBLE,
+                &mut size,
+                &mut count,
+                buf.as_mut_ptr() as *mut PdhItem,
+            );
+            if rc != 0 {
+                return None;
+            }
+            let items = std::slice::from_raw_parts(buf.as_ptr() as *const PdhItem, count as usize);
+            for it in items {
+                if it.name.is_null() {
+                    continue;
+                }
+                let name = pcwstr_to_string(it.name).to_ascii_lowercase();
+                if name.contains(self.luid_tag.as_str()) {
+                    let v = it.value.double_value;
+                    if v >= 0.0 {
+                        return Some(v as u64);
+                    }
+                }
+            }
+            None
+        }
+    }
+}
+
 // ---------------------------------------------------------------- PDH: GPU 使用率
 
 #[repr(C)]
@@ -622,6 +711,11 @@ pub struct GpuUsage {
     last_total: u32,
     /// 这张卡的名字（来自 DXGI），用于界面/日志。
     adapter_name: Option<String>,
+    /// 这张卡在 DXGI 里的序号（查显存占用要用它重新取 adapter）。
+    adapter_index: Option<u32>,
+    /// 显存占用：分母 = 卡的专用显存规格，分子 = PDH 整机占用。
+    vram_total: u64,
+    vram: Option<GpuVram>,
 }
 
 impl GpuUsage {
@@ -634,7 +728,7 @@ impl GpuUsage {
                 let name = a.name.clone();
                 let mut g = Self::open(Some(tag))?;
                 g.adapter_name = Some(name);
-                Some(g)
+                Some(g.with_index(a.index))
             }
             None => Self::open(None),
         }
@@ -666,12 +760,36 @@ impl GpuUsage {
             last_matched: 0,
             last_total: 0,
             adapter_name: None,
+            adapter_index: None,
+            vram_total: 0,
+            vram: None,
         })
     }
 
     /// 这张卡的名字（DXGI 描述），拿不到为 None。
     pub fn adapter_name(&self) -> Option<&str> {
         self.adapter_name.as_deref()
+    }
+
+    /// 绑定 DXGI 序号（探针按"逐卡"创建时用），顺带把显存占用的查询建好。
+    pub fn with_index(mut self, index: u32) -> Self {
+        self.adapter_index = Some(index);
+        self.vram_total = adapter_dedicated_vram(index).unwrap_or(0);
+        if let Some(tag) = self.luid_tag.clone() {
+            self.vram = GpuVram::new(&tag);
+        }
+        self
+    }
+
+    /// 显存占用率（%，0..100）。需要先绑定 DXGI 序号（`new()` / `with_index()` 会给）。
+    pub fn vram_percent(&mut self) -> Option<i32> {
+        let total = self.vram_total;
+        if total == 0 {
+            return None;
+        }
+        let used = self.vram.as_mut()?.used_bytes()?;
+        let pct = (used as f64) * 100.0 / (total as f64);
+        Some(pct.round().clamp(0.0, 100.0) as i32)
     }
 
     /// (命中实例数, 全部实例数)。用于诊断"过滤条件是否真的匹配上了"。
@@ -770,6 +888,7 @@ unsafe fn pcwstr_to_string(p: *const u16) -> String {
 pub fn collect(cpu: &mut CpuUsage, gpu: &mut Option<GpuUsage>) -> Sample {
     let (ct, cf, gt, gf) = lhm_sample();
     let gu = gpu.as_mut().and_then(|g| g.sample());
+    let gv = gpu.as_mut().and_then(|g| g.vram_percent());
     Sample {
         ct,
         cu: cpu.sample(),
@@ -779,6 +898,7 @@ pub fn collect(cpu: &mut CpuUsage, gpu: &mut Option<GpuUsage>) -> Sample {
         gu,
         gf: gf.map(|f| f.wire()),
         mu: mem_percent(),
+        gv,
         cf_unit: cf.map(|f| f.unit).unwrap_or(FanUnit::Rpm),
         gf_unit: gf.map(|f| f.unit).unwrap_or(FanUnit::Rpm),
         cf_display: cf.map(|f| f.display()),
@@ -818,6 +938,14 @@ mod gpu_tests {
 
         assert!(total > 0, "PDH 应有 GPU Engine(*)\\Utilization 实例");
         assert!(matched > 0, "按 LUID 过滤后必须命中实例（否则 LUID 片段格式不对）");
+
+        // 显存占用率（PDH \GPU Adapter Memory）：本机有真显卡就该有值
+        let mut gv = GpuUsage::new_for_luid(p.luid_high, p.luid_low)
+            .expect("PDH 打开")
+            .with_index(p.index);
+        let vram = gv.vram_percent().expect("显存占用应能取到");
+        println!("vram_percent = {vram}%");
+        assert!((0..=100).contains(&vram), "显存占用率必须落在 0..100");
         if let Some(x) = v {
             assert!((0..=100).contains(&x), "利用率必须落在 0..100");
         }

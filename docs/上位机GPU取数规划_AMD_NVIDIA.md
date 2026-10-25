@@ -93,10 +93,15 @@ sample=Some(0)  matched=21/406          ← 过滤生效
 | 温度 | NVML `GetTemperature` | ADL `OD6/OD8_Temperature_Get` | IGCL / LHM | LHM |
 | 利用率 | NVML `GetUtilizationRates` | ADL `CurrentActivity` | PDH（已按 LUID） | PDH |
 | 风扇 | NVML `GetFanSpeed_v2`（%） | ADL `FanSpeed_Get`（% 或 RPM） | LHM RPM | LHM |
-| 显存 | `nvmlDeviceGetMemoryInfo` | ADL / DXGI | DXGI | DXGI `QueryVideoMemoryInfo` |
+| 显存 | PDH `\GPU Adapter Memory` | PDH（同左） | PDH（同左） | **PDH `\GPU Adapter Memory(*)`** |
 | 功耗 | `nvmlDeviceGetPowerUsage` | ADL OD | LHM | LHM |
 
 关键事实：
+
+- ⚠ **显存占用别用 DXGI `QueryVideoMemoryInfo`**：它返回**本进程**的预算/用量
+  （实测监控程序恒为 0%）。整机口径要用 PDH `\GPU Adapter Memory(*)\Dedicated Usage`
+  （任务管理器同源、厂商无关），实例名 `luid_..._phys_0` 按 LUID 挑卡，
+  分母用 DXGI `GetDesc1().DedicatedVideoMemory`。实测 A770：2.96 GB / 15.9 GiB ≈ **17%**。
 
 - **NVML / ADL 不需要管理员**（只有 LHM 读 MSR/SuperIO 要），本程序已 `requireAdministrator`，
   两个库都能直接 `LoadLibrary`。
@@ -159,7 +164,7 @@ pub trait GpuBackend {
 | key | 含义 |
 | --- | --- |
 | `T2` `U2` `F2` | 第二块 GPU 温度 / 利用率 / 风扇 |
-| `GV` | 显存占用 % |
+| `GV` | 显存占用 %（**已实现**：上位机 GPU 卡片里的「显存」，默认不勾） |
 | `GP` | 功耗 W |
 
 固件 v24 会忽略这些 key，可以先发；等需要屏上显示双卡时再改固件版面

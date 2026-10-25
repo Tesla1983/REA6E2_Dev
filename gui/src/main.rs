@@ -67,8 +67,8 @@ fn selftest() {    // release 构建是 /SUBSYSTEM:windows（无控制台），p
     std::thread::sleep(Duration::from_millis(700));
     let s = collector::collect(&mut cpu, &mut gpu);
     say!(
-        "采样              : CT={:?} CU={:?} CF={:?} GT={:?} GU={:?} GF={:?} MU={:?}",
-        s.ct, s.cu, s.cf, s.gt, s.gu, s.gf, s.mu
+        "采样              : CT={:?} CU={:?} CF={:?} GT={:?} GU={:?} GF={:?} MU={:?} GV={:?}",
+        s.ct, s.cu, s.cf, s.gt, s.gu, s.gf, s.mu, s.gv
     );
 
     say!("风扇单位          : CF={:?} GF={:?}", s.cf_unit, s.gf_unit);
@@ -80,6 +80,7 @@ fn selftest() {    // release 构建是 /SUBSYSTEM:windows（无控制台），p
         (true, "GT"),
         (true, "GU"),
         (true, "GF"),
+        (true, "GV"),
         (true, "MU"),
     ];
     let payload = board::build_payload(&s, &mask);
@@ -178,15 +179,19 @@ fn probe_gpu() {
             continue;
         }
         match collector::GpuUsage::new_for_luid(a.luid_high, a.luid_low) {
-            Some(mut g) => {
+            Some(g) => {
+                let mut g = g.with_index(a.index);
                 std::thread::sleep(Duration::from_millis(300));
                 let v = g.sample();
                 let (m, t) = g.last_stats();
                 say!(
-                    "  [{}] {}: 3D={}%  命中实例 {}/{}",
+                    "  [{}] {}: 3D={}%  显存={}  命中实例 {}/{}",
                     a.index,
                     a.name,
                     v.map(|x| x.to_string()).unwrap_or_else(|| "--".into()),
+                    g.vram_percent()
+                        .map(|x| format!("{x}%"))
+                        .unwrap_or_else(|| "--".into()),
                     m,
                     t
                 );
