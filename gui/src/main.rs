@@ -4,6 +4,7 @@ mod app;
 mod board;
 mod collector;
 mod lhm;
+mod tray;
 
 use std::time::Duration;
 

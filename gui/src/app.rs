@@ -1,5 +1,6 @@
 //! 主窗口：左「板子识别 + 连接」，右「发送数据项 + 实时帧 + 统计」。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -99,6 +100,16 @@ pub struct App {
     last_change: Option<Instant>,
     /// 是否已经按本机屏幕做过一次"夹取"（只做一次，别跟用户手动拖动打架）
     screen_checked: bool,
+    /// 托盘图标（Windows）。None = 创建失败（Explorer 没跑 / 被安全软件拦），
+    /// 此时关窗就正常退出。
+    tray: Option<crate::tray::Tray>,
+    tray_rx: Receiver<crate::tray::TrayEvent>,
+    /// 托盘菜单点了「退出」⇒ 允许真正关闭窗口（否则关窗只是缩到托盘）
+    quit_from_tray: bool,
+    /// 托盘线程写的"退出"标志：窗口隐藏时 UI 可能不刷新，用共享原子变量兜底
+    tray_quit: Arc<AtomicBool>,
+    /// 用户手动点过「收进托盘」，用于日志/状态提示
+    hidden_to_tray: bool,
 }
 
 impl App {
@@ -119,6 +130,11 @@ impl App {
         let saved = Settings::load();
         let zoom = saved.zoom;
         cc.egui_ctx.set_zoom_factor(zoom);
+
+        // 系统托盘：独立线程 + 自己的消息循环（见 tray.rs）
+        let (tray_tx, tray_rx) = channel();
+        let tray_quit = Arc::new(AtomicBool::new(false));
+        let tray = crate::tray::Tray::spawn(tray_tx, tray_quit.clone());
 
         // 先把上次见过的板子从磁盘缓存里灌进来 —— 界面**立刻**有内容，
         // 不用等扫描。随后 start_scan() 在后台核实并刷新。
@@ -142,6 +158,11 @@ impl App {
             pending: saved,
             last_change: None,
             screen_checked: false,
+            tray,
+            tray_rx,
+            quit_from_tray: false,
+            tray_quit,
+            hidden_to_tray: false,
         };
         app.push_log(format!("中文字体: {}", app.font_note.clone()));
         app.push_log(format!("界面缩放: {:.0}%", app.zoom * 100.0));
@@ -681,6 +702,51 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        // ---- 系统托盘事件 ----
+        let mut want_close = false;
+        while let Ok(ev) = self.tray_rx.try_recv() {
+            match ev {
+                crate::tray::TrayEvent::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    if self.hidden_to_tray {
+                        self.hidden_to_tray = false;
+                        self.push_log("已从托盘恢复窗口".into());
+                    }
+                }
+                crate::tray::TrayEvent::Quit => {
+                    self.quit_from_tray = true;
+                    want_close = true;
+                }
+            }
+        }
+        if want_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // 托盘「退出」也可能只写了共享标志（窗口隐藏时通道事件可能没人收）
+        if self.tray_quit.load(Ordering::Relaxed) && !self.quit_from_tray {
+            self.quit_from_tray = true;
+            self.push_log("托盘菜单请求退出".into());
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // ---- 点关窗 = 缩到托盘；托盘菜单「退出」才真正退出 ----
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.tray.is_some()
+            && !self.quit_from_tray
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if !self.hidden_to_tray {
+                self.hidden_to_tray = true;
+                self.push_log(
+                    "已收进系统托盘：双击托盘图标恢复；右键菜单里有「退出」".to_string(),
+                );
+            }
+        }
+
         // ---- 换机/换人使用时的一次性自适应 ----
         // 配置是**按 Windows 账号 + 本机**存的（%LOCALAPPDATA%），换台机器/换个用户
         // 会用自己的默认值，这没问题；但"别处存下的大尺寸/大缩放"如果被带过来，
@@ -804,6 +870,10 @@ impl eframe::App for App {
     /// 用 `pending` 而不是 `saved`：关了窗就再也没机会补写了，要取最新的。
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.pending.save();
+        // 删掉托盘图标，别在任务栏留"幽灵图标"
+        if let Some(t) = &self.tray {
+            t.shutdown();
+        }
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -829,6 +899,22 @@ impl App {
                 };
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
                 ui.painter().circle_filled(rect.center(), 4.5, dot);
+
+                if self.tray.is_some() {
+                    if ui
+                        .add_enabled(
+                            !self.hidden_to_tray,
+                            egui::Button::new(egui::RichText::new("收进托盘").size(11.0)),
+                        )
+                        .on_hover_text("隐藏到系统托盘（采样与发帧继续）。双击托盘图标可恢复")
+                        .clicked()
+                    {
+                        self.hidden_to_tray = true;
+                        self.push_log("已收进系统托盘（采样与发帧继续）".into());
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    }
+                    ui.add_space(6.0);
+                }
 
                 ui.label(egui::RichText::new("RA6E2 系统监控台").size(14.0).strong());
                 ui.label(egui::RichText::new("v0.1").size(11.0).weak());
