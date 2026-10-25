@@ -90,7 +90,13 @@ pub struct App {
     mask_shared: Arc<Mutex<Mask>>,
     font_note: String,
     /// 界面缩放（= 字体与控件大小）。1.0 = 100%，持久化到 %LOCALAPPDATA%。
+    /// 每帧从 `ctx.zoom_factor()` 同步（缩放菜单和 Ctrl+滚轮都会改它）。
     zoom: f32,
+    /// 已落盘的偏好（用来判断有没有变化）
+    saved: Settings,
+    /// 正在变化中的偏好 + 最后一次变化的时刻（去抖：停手 600ms 再写盘）
+    pending: Settings,
+    last_change: Option<Instant>,
 }
 
 impl App {
@@ -107,7 +113,9 @@ impl App {
         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
         cc.egui_ctx.set_visuals(build_visuals());
 
-        let zoom = load_zoom();
+        // 读上次的界面偏好（缩放 + 窗口大小）；窗口大小由 main.rs 建窗口时用
+        let saved = Settings::load();
+        let zoom = saved.zoom;
         cc.egui_ctx.set_zoom_factor(zoom);
 
         // 先把上次见过的板子从磁盘缓存里灌进来 —— 界面**立刻**有内容，
@@ -128,6 +136,9 @@ impl App {
             mask_shared: Arc::new(Mutex::new(Mask::default())),
             font_note,
             zoom,
+            saved,
+            pending: saved,
+            last_change: None,
         };
         app.push_log(format!("中文字体: {}", app.font_note.clone()));
         app.push_log(format!("界面缩放: {:.0}%", app.zoom * 100.0));
@@ -163,6 +174,44 @@ impl App {
         self.log.push(format!("{ts} {s}"));
         if self.log.len() > 300 {
             self.log.drain(..100);
+        }
+    }
+
+    /// 当前界面偏好（缩放 + 窗口内尺寸）。
+    fn current_settings(ctx: &egui::Context) -> Settings {
+        let window = ctx
+            .input(|i| i.viewport().inner_rect)
+            .map(|r| (r.width(), r.height()));
+        Settings { zoom: ctx.zoom_factor(), window }
+    }
+
+    /// 立刻落盘（缩放菜单点选、关窗时用）。
+    fn save_settings_now(&mut self, ctx: &egui::Context) {
+        let st = Self::current_settings(ctx);
+        st.save();
+        self.saved = st;
+        self.pending = st;
+        self.last_change = None;
+    }
+
+    /// 每帧调用：值**稳定 600 ms** 后自动落盘。
+    /// 拖动窗口 / Ctrl+滚轮时每秒会变几十次，不去抖就会疯狂写文件。
+    fn autosave_settings(&mut self, ctx: &egui::Context) {
+        let cur = Self::current_settings(ctx);
+        self.zoom = cur.zoom;              // 让"当前 xx%"跟随 Ctrl+滚轮
+
+        if cur != self.pending {
+            self.pending = cur;
+            self.last_change = Some(Instant::now());
+            return;
+        }
+        if self.pending == self.saved {
+            return;
+        }
+        if self.last_change.map(|t| t.elapsed().as_millis() >= 600).unwrap_or(false) {
+            self.pending.save();
+            self.saved = self.pending;
+            self.last_change = None;
         }
     }
 
@@ -470,26 +519,68 @@ fn settings_path() -> std::path::PathBuf {
     std::path::PathBuf::from(base).join("Ra6e2Monitor").join("ui.json")
 }
 
-fn load_zoom() -> f32 {
-    if let Ok(text) = std::fs::read_to_string(settings_path()) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(z) = v.get("zoom").and_then(|x| x.as_f64()) {
-                if (0.6..=2.5).contains(&z) {
-                    return z as f32;
+/// 会持久化到 `%LOCALAPPDATA%\Ra6e2Monitor\ui.json` 的用户界面偏好。
+///
+/// 记住两样东西：
+///   · `zoom`   —— 界面缩放（缩放菜单、Ctrl+滚轮都算）；
+///   · `window` —— 窗口内尺寸（点/逻辑像素），`main.rs` 建窗口时读取。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Settings {
+    pub zoom: f32,
+    pub window: Option<(f32, f32)>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { zoom: 1.0, window: None }
+    }
+}
+
+impl Settings {
+    /// 读配置：文件缺失/损坏/字段越界一律退回默认值，绝不 panic。
+    pub fn load() -> Self {
+        let mut out = Self::default();
+        let Ok(text) = std::fs::read_to_string(settings_path()) else {
+            return out;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return out;
+        };
+        if let Some(z) = v.get("zoom").and_then(|x| x.as_f64()) {
+            if (0.6..=2.5).contains(&z) {
+                out.zoom = z as f32;
+            }
+        }
+        if let Some(arr) = v.get("window").and_then(|x| x.as_array()) {
+            if arr.len() == 2 {
+                let w = arr[0].as_f64().unwrap_or(0.0);
+                let h = arr[1].as_f64().unwrap_or(0.0);
+                // 太小（还没布局完就存了）不认；过大夹一下
+                if w >= 640.0 && h >= 400.0 {
+                    out.window = Some((w.min(8000.0) as f32, h.min(8000.0) as f32));
                 }
             }
         }
+        out
     }
-    1.0
+
+    pub fn save(&self) {
+        let p = settings_path();
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let text = match self.window {
+            Some((w, h)) => format!(
+                "{{\"zoom\":{},\"window\":[{:.0},{:.0}]}}",
+                self.zoom, w, h
+            ),
+            None => format!("{{\"zoom\":{}}}", self.zoom),
+        };
+        let _ = std::fs::write(p, text);
+    }
 }
 
-fn save_zoom(z: f32) {
-    let p = settings_path();
-    if let Some(dir) = p.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(p, format!("{{\"zoom\":{z}}}"));
-}
+
 
 fn chrono_like_now() -> String {
     let now = std::time::SystemTime::now()
@@ -551,6 +642,9 @@ impl eframe::App for App {
             self.center_panel(ui, &sample, sent, errors, &last_frame, rate);
         });
 
+        // 缩放（含 Ctrl+滚轮）与窗口大小变化 → 去抖后写盘
+        self.autosave_settings(&ctx);
+
         ctx.request_repaint_after(Duration::from_millis(200));
     }
 
@@ -560,6 +654,12 @@ impl eframe::App for App {
     /// **alpha = 180 是半透明**。本程序窗口不是透明窗口，驱动会把它跟窗口底色
     /// （白色）合成 ⇒ 启动/重绘时能看到一次**亮闪**。
     /// 这里强制 alpha = 1.0，颜色取当前主题的面板色，彻底消除这次闪。
+    /// 关窗前把**最后一次观测到**的缩放/窗口尺寸立刻写盘（不必等 600 ms 去抖）。
+    /// 用 `pending` 而不是 `saved`：关了窗就再也没机会补写了，要取最新的。
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.pending.save();
+    }
+
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         let mut c = visuals.window_fill.to_normalized_gamma_f32();
         c[3] = 1.0;
@@ -604,7 +704,7 @@ impl App {
                             if ui.selectable_label(sel, label).clicked() {
                                 self.zoom = z;
                                 ui.ctx().set_zoom_factor(z);
-                                save_zoom(z);
+                                self.save_settings_now(ui.ctx());
                                 ui.close();
                             }
                         }
@@ -893,4 +993,32 @@ fn metric(ui: &mut egui::Ui, label: &str, value: &str, color: Option<egui::Color
             ui.label(t);
         });
     });
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    /// 配置读写往返 + 越界值兜底（2026-10-25 加的持久化）。
+    #[test]
+    fn settings_roundtrip_and_clamp() {
+        let tmp = std::env::temp_dir().join("ra6e2_ui_settings_test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        // SAFETY: 本用例独占 LOCALAPPDATA（其它用例不读它）；这里只在测试进程里改环境变量。
+        unsafe { std::env::set_var("LOCALAPPDATA", &tmp) };
+
+        let want = Settings { zoom: 1.25, window: Some((1280.0, 720.0)) };
+        want.save();
+        assert_eq!(Settings::load(), want, "写进去的缩放/窗口大小要能原样读回");
+
+        // 越界或被写坏的值：zoom 回 1.0，窗口回 None
+        std::fs::write(settings_path(), r#"{"zoom":9.0,"window":[100,50]}"#).unwrap();
+        let bad = Settings::load();
+        assert_eq!(bad.zoom, 1.0, "0.6..=2.5 之外的缩放要拒绝");
+        assert_eq!(bad.window, None, "过小的窗口尺寸要拒绝");
+
+        // 损坏的 JSON 不能 panic
+        std::fs::write(settings_path(), "not json").unwrap();
+        assert_eq!(Settings::load(), Settings::default());
+    }
 }

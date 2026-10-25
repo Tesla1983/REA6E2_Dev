@@ -25,13 +25,17 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // 恢复上次的窗口大小（界面缩放由 App::new 里的 Settings 负责）
+    let cfg = app::Settings::load();
+    let (win_w, win_h) = cfg.window.unwrap_or((960.0, 600.0));
+
     let options = eframe::NativeOptions {
         // 用 glow(OpenGL) 而不是 wgpu：wgpu 的 surface 是异步建立的，
         // 在本机（Intel Arc A770 / D3D12）启动时会出现整窗闪一下。
         // 想回退只需把这里改成 Renderer::Wgpu（Cargo 里 wgpu 依赖仍保留）。
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 600.0])
+            .with_inner_size([win_w.max(840.0), win_h.max(540.0)])
             .with_min_inner_size([840.0, 540.0])
             .with_title("RA6E2 系统监控台"),
         ..Default::default()
