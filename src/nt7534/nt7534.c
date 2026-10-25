@@ -392,17 +392,18 @@ static void draw_layout_a(void)
         return;
     }
 
-    /* --- 表格线 --- */
-    u8g2_DrawHLine(g, 0, 0, 120);
-    u8g2_DrawHLine(g, 0, 16, 120);
-    u8g2_DrawHLine(g, 0, 32, 120);
+    /* --- 表格线 ---
+     * 右边界 127(原 119): 屏右侧 x120..127 的 8px 空白全部用掉, 表格贴到最右一列。 */
+    u8g2_DrawHLine(g, 0, 0, 128);
+    u8g2_DrawHLine(g, 0, 16, 128);
+    u8g2_DrawHLine(g, 0, 32, 128);
     u8g2_DrawHLine(g, 0, 47, 55);       /* 仅左半: 右侧风扇格纵向合并 */
-    u8g2_DrawHLine(g, 0, 63, 120);
+    u8g2_DrawHLine(g, 0, 63, 128);
     u8g2_DrawVLine(g, 0, 0, 64);
     u8g2_DrawVLine(g, 24, 0, 47);       /* linked 行特意不画, 免得穿过文字 */
     u8g2_DrawVLine(g, 54, 0, 64);
     u8g2_DrawVLine(g, 86, 0, 64);
-    u8g2_DrawVLine(g, 119, 0, 64);
+    u8g2_DrawVLine(g, 127, 0, 64);
 
     /* --- CPU 行 --- */
     draw_cell(g, "CPU", 1, 23, 1, 15);
@@ -414,7 +415,7 @@ static void draw_layout_a(void)
     (void) snprintf(s, sizeof(s), "%s%%", u);
     draw_cell(g, s, 55, 85, 1, 15);
     num4(r, sizeof(r), d->cf);
-    draw_cell(g, r, 87, 118, 1, 15);
+    draw_cell(g, r, 87, 126, 1, 15);
 
     /* --- GPU 行 --- */
     draw_cell(g, "GPU", 1, 23, 17, 31);
@@ -426,7 +427,7 @@ static void draw_layout_a(void)
     (void) snprintf(s, sizeof(s), "%s%%", u);
     draw_cell(g, s, 55, 85, 17, 31);
     num4(r, sizeof(r), d->gf);
-    draw_cell(g, r, 87, 118, 17, 31);
+    draw_cell(g, r, 87, 126, 17, 31);
 
     /* --- RAM 行 --- */
     draw_cell(g, "RAM", 1, 23, 33, 46);
@@ -440,13 +441,13 @@ static void draw_layout_a(void)
     /* --- 右下角风扇格: 顶部 5x7 小字标签(y34, 离横线2px/离风扇2px) + 20x20 风扇 --- */
     draw_small_label(g, "CPU", 55, 85, 34);
     draw_fan        (g, 60, 43, s_fan_phase_cd[0]);
-    draw_small_label(g, "GPU", 87, 118, 34);
-    draw_fan        (g, 93, 43, s_fan_phase_cd[1]);
+    draw_small_label(g, "GPU", 87, 126, 34);
+    draw_fan        (g, 97, 43, s_fan_phase_cd[1]);
 
     if (0u != s_flush_area)
     {
-        /* 脏区: x54..119 / y32..63 ⇒ tile tx=6(48), tw=9, ty=4, th=4(页4..7) */
-        U8G2_Port_FlushArea(6u, 4u, 9u, 4u);
+        /* 脏区: x54..127 / y32..63 ⇒ tile tx=6(48), tw=10(48..127), ty=4, th=4(页4..7) */
+        U8G2_Port_FlushArea(6u, 4u, 10u, 4u);
     }
     else
     {
