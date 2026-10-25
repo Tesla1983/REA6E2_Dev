@@ -70,6 +70,15 @@ sample=Some(0)  matched=21/406          ← 过滤生效
 
 理由：100% ⇒ 2000，落在固件 3000 钳位之内且转速观感合理；界面标 `%` 不骗人。
 
+⚠ **协议值 ≠ 显示值**（2026-10-25 踩过）：`Sample.cf/gf` 是协议值（百分比已 ×20），
+界面要用 `Sample.cf_display/gf_display`（`FanReading::display()`：RPM 原值 / 百分比 0..100）。
+否则 13% 会显示成 "260%"。
+
+⚠ **同名叶子陷阱**：LHM 里 `Fans/System Fan #3 = 713 RPM` 与
+`Controls/System Fan #3 = 19.0 %` 是同一个物理风扇的两个通道。
+`Controls` 是 PWM 占空比，**不能当转速**。解析必须**RPM 优先**、百分比仅作兜底
+（`lhm_parse()` 里分 `*_rpm` / `*_pct` 两路收集，最后 `rpm.or(pct)`）。
+
 实现在 `collector.rs` 的 `FanUnit` / `FanReading`：LHM 叶子值自带单位（`1050 RPM` / `60 %`），
 按后缀判定，不再假设「一定是 RPM」。`Sample.cf_unit / gf_unit` 带到 UI。
 

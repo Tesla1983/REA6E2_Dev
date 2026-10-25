@@ -32,6 +32,10 @@ pub struct Sample {
     /// 风扇值的原始单位（只影响 UI 后缀显示）
     pub cf_unit: FanUnit,
     pub gf_unit: FanUnit,
+    /// 风扇的**显示值**（RPM 原值 / 百分比 0..100）。
+    /// `cf/gf` 是协议值（百分比已 ×20），**不能直接拿去显示**。
+    pub cf_display: Option<i32>,
+    pub gf_display: Option<i32>,
 }
 
 // ---------------------------------------------------------------- 风扇单位语义
@@ -84,6 +88,15 @@ impl FanReading {
         match self.unit {
             FanUnit::Rpm => self.raw.clamp(0, 3000),
             FanUnit::Percent => ((self.raw as f64) * 20.0).round().clamp(0.0, 2000.0) as i32,
+        }
+    }
+
+    /// 给人看的数值（RPM 原值；百分比还原成 0..100）。
+    /// ⚠ 和 `wire()` 不是一回事：协议值是 %×20，直接显示会变成 "260%"。
+    pub fn display(&self) -> i32 {
+        match self.unit {
+            FanUnit::Rpm => self.raw,
+            FanUnit::Percent => self.raw.clamp(0, 100),
         }
     }
 }
@@ -158,7 +171,11 @@ fn lhm_sample() -> (Option<i32>, Option<FanReading>, Option<i32>, Option<FanRead
         Ok(v) => v,
         Err(_) => return (None, None, None, None),
     };
+    lhm_parse(&root)
+}
 
+/// 纯解析（把 JSON 树 → 4 个读数），**不碰网络** —— 便于用固定样本做回归测试。
+fn lhm_parse(root: &Value) -> (Option<i32>, Option<FanReading>, Option<i32>, Option<FanReading>) {
     // 摊平成 (路径, 叶子名, 值)；路径形如
     //   Sensor / <机器名> / <硬件名> / <分组> / <叶子>
     let mut leaves: Vec<(Vec<String>, String, String)> = Vec::new();
@@ -166,9 +183,14 @@ fn lhm_sample() -> (Option<i32>, Option<FanReading>, Option<i32>, Option<FanRead
 
     let mut cpu_core_max: Option<f64> = None;
     let mut cpu_package: Option<f64> = None;
-    let mut cpu_fan: Option<FanReading> = None;
+    // ⚠ 同名叶子会同时出现在 `Fans`（RPM）和 `Controls`（PWM %）两个分组里，
+    //   实测：`Fans/System Fan #3 = 713 RPM`、`Controls/System Fan #3 = 19.0 %`。
+    //   ⇒ 分开收集，最后 **RPM 优先**（PWM 只是"没有转速线/只有百分比"时的兜底）。
+    let mut cpu_fan_rpm: Option<FanReading> = None;
+    let mut cpu_fan_pct: Option<FanReading> = None;
     let mut gpu_temp: Option<f64> = None;
-    let mut gpu_fan: Option<FanReading> = None;
+    let mut gpu_fan_rpm: Option<FanReading> = None;
+    let mut gpu_fan_pct: Option<FanReading> = None;
 
     for (path, leaf, value) in &leaves {
         let hw = hw_name(path).to_lowercase();
@@ -207,25 +229,36 @@ fn lhm_sample() -> (Option<i32>, Option<FanReading>, Option<i32>, Option<FanRead
             continue;
         }
 
-        // 风扇：叶子值带单位（`1050 RPM` / `60 %`），按后缀判定单位，
-        // 不再假设只可能是 RPM —— NVIDIA 桌面卡在 NVAPI/LHM 里常给百分比。
+        // 风扇：叶子值带单位（`713 RPM` / `19.0 %`），按后缀判定单位。
+        // ⚠ 必须区分 Fans(RPM) 与 Controls(PWM %)：两者叶子名相同，
+        //   若不加区分，Controls 的值会覆盖掉真实的 RPM（2026-10-25 实测踩过）。
         if lv.contains("rpm") || lv.contains('%') {
-            let read = if lv.contains("rpm") {
+            let is_rpm = lv.contains("rpm");
+            let read = if is_rpm {
                 FanReading::rpm(num)
             } else {
                 FanReading::percent(num)
             };
-            if is_gpu && ll.contains("gpu fan") && gpu_fan.is_none() {
-                gpu_fan = Some(read);
+
+            if is_gpu && ll.contains("gpu fan") {
+                if is_rpm {
+                    let _ = gpu_fan_rpm.get_or_insert(read);
+                } else {
+                    let _ = gpu_fan_pct.get_or_insert(read);
+                }
             } else if is_superio && leaf.eq_ignore_ascii_case(CPU_FAN_NAME) {
-                cpu_fan = Some(read);
+                if is_rpm {
+                    let _ = cpu_fan_rpm.get_or_insert(read);
+                } else {
+                    let _ = cpu_fan_pct.get_or_insert(read);
+                }
             }
         }
     }
 
     let ct = cpu_core_max.or(cpu_package).map(|v| v.round() as i32);
     let gt = gpu_temp.map(|v| v.round() as i32);
-    (ct, cpu_fan, gt, gpu_fan)
+    (ct, cpu_fan_rpm.or(cpu_fan_pct), gt, gpu_fan_rpm.or(gpu_fan_pct))
 }
 
 /// 调试用（`--probe-gpu`）：把 LHM `data.json` 摊平成 (硬件名, 分组, "叶子=值")。
@@ -748,6 +781,8 @@ pub fn collect(cpu: &mut CpuUsage, gpu: &mut Option<GpuUsage>) -> Sample {
         mu: mem_percent(),
         cf_unit: cf.map(|f| f.unit).unwrap_or(FanUnit::Rpm),
         gf_unit: gf.map(|f| f.unit).unwrap_or(FanUnit::Rpm),
+        cf_display: cf.map(|f| f.display()),
+        gf_display: gf.map(|f| f.display()),
     }
 }
 
@@ -785,6 +820,82 @@ mod gpu_tests {
         assert!(matched > 0, "按 LUID 过滤后必须命中实例（否则 LUID 片段格式不对）");
         if let Some(x) = v {
             assert!((0..=100).contains(&x), "利用率必须落在 0..100");
+        }
+    }
+
+    /// 回归：LHM 里 `Fans/System Fan #3 = 713 RPM` 与 `Controls/System Fan #3 = 19.0 %`
+    /// 是同名叶子，必须取 **RPM**（2026-10-25 现场看到 260% 就是这个覆盖导致的）。
+    #[test]
+    fn lhm_prefers_fan_rpm_over_pwm_controls() {
+        let json = r#"{
+          "Text": "Sensor",
+          "Children": [{
+            "Text": "PC",
+            "Children": [{
+              "Text": "MSI H610M BOMBER DDR4 (MS-7D46)",
+              "Children": [{
+                "Text": "Nuvoton NCT6687D",
+                "Children": [
+                  {"Text": "Fans", "Children": [
+                    {"Text": "System Fan #3", "Value": "713 RPM"},
+                    {"Text": "System Fan #5", "Value": "876 RPM"}
+                  ]},
+                  {"Text": "Controls", "Children": [
+                    {"Text": "System Fan #3", "Value": "19.0 %"},
+                    {"Text": "System Fan #5", "Value": "56.0 %"}
+                  ]}
+                ]
+              }]
+            }]
+          }]
+        }"#;
+        let root: Value = serde_json::from_str(json).unwrap();
+        let (_ct, cf, _gt, _gf) = lhm_parse(&root);
+        let cf = cf.expect("应取到 CPU 风扇");
+        assert_eq!(cf.unit, FanUnit::Rpm, "必须优先 RPM，不能被 Controls 的百分比覆盖");
+        assert_eq!(cf.raw, 713);
+        assert_eq!(cf.wire(), 713, "RPM 直发");
+        assert_eq!(cf.display(), 713);
+    }
+
+    /// 只有百分比时（NVIDIA 桌面卡的常态）：发 %×20，但显示仍是百分比本身。
+    #[test]
+    fn lhm_percent_only_fan_is_scaled_for_wire_but_shown_as_percent() {
+        let json = r#"{
+          "Text": "Sensor", "Children": [{"Text": "PC", "Children": [{
+            "Text": "NVIDIA GeForce RTX 4070", "Children": [
+              {"Text": "Temperatures", "Children": [{"Text": "GPU Core", "Value": "62.0 °C"}]},
+              {"Text": "Fans", "Children": [{"Text": "GPU Fan", "Value": "60.0 %"}]}
+            ]
+          }]}]
+        }"#;
+        let root: Value = serde_json::from_str(json).unwrap();
+        let (_ct, _cf, gt, gf) = lhm_parse(&root);
+        assert_eq!(gt, Some(62));
+        let gf = gf.expect("应取到 GPU 风扇");
+        assert_eq!(gf.unit, FanUnit::Percent);
+        assert_eq!(gf.wire(), 1200, "60% × 20");
+        assert_eq!(gf.display(), 60, "界面必须显示 60 而不是 1200 或 1200%");
+    }
+
+    /// 现场验证（需要 LHM 在跑，默认 ignore）：
+    ///   cargo test --release -- --ignored live_lhm --nocapture
+    /// 本机（MSI H610M / NCT6687D）CPU 风扇真值在 `Fans/System Fan #3`，是 RPM。
+    #[test]
+    #[ignore]
+    fn live_lhm_sanity() {
+        assert!(lhm_alive(), "LHM 没在跑，先启动上位机");
+        let (ct, cf, gt, gf) = lhm_sample();
+        println!("live: ct={ct:?} cf={cf:?} gt={gt:?} gf={gf:?}");
+        if let Some(f) = cf {
+            println!("  CPU 风扇: raw={} unit={:?} wire={} display={}",
+                     f.raw, f.unit, f.wire(), f.display());
+            assert_eq!(f.unit, FanUnit::Rpm, "本机 CPU 风扇应为 RPM（PWM 在 Controls 分组）");
+            assert!(f.raw >= 100, "RPM 不该是 PWM 那种 0..100 的数（本机实测 600~900）");
+        }
+        if let Some(f) = gf {
+            println!("  GPU 风扇: raw={} unit={:?} wire={} display={}",
+                     f.raw, f.unit, f.wire(), f.display());
         }
     }
 
