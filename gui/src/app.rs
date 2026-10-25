@@ -1,6 +1,6 @@
 //! 主窗口：左「板子识别 + 连接」，右「发送数据项 + 实时帧 + 统计」。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -104,10 +104,9 @@ pub struct App {
     /// 此时关窗就正常退出。
     tray: Option<crate::tray::Tray>,
     tray_rx: Receiver<crate::tray::TrayEvent>,
-    /// 托盘菜单点了「退出」⇒ 允许真正关闭窗口（否则关窗只是缩到托盘）
-    quit_from_tray: bool,
-    /// 托盘线程写的"退出"标志：窗口隐藏时 UI 可能不刷新，用共享原子变量兜底
-    tray_quit: Arc<AtomicBool>,
+    /// 托盘线程写的"退出"标志（App 不再读它：关窗语义改成直接退出后，
+    /// 托盘「退出」靠通道事件 + 直接发 WM_CLOSE 就够了）
+    _tray_quit: Arc<AtomicBool>,
     /// 用户手动点过「收进托盘」，用于日志/状态提示
     hidden_to_tray: bool,
 }
@@ -160,8 +159,7 @@ impl App {
             screen_checked: false,
             tray,
             tray_rx,
-            quit_from_tray: false,
-            tray_quit,
+            _tray_quit: tray_quit,
             hidden_to_tray: false,
         };
         app.push_log(format!("中文字体: {}", app.font_note.clone()));
@@ -716,7 +714,7 @@ impl eframe::App for App {
                     }
                 }
                 crate::tray::TrayEvent::Quit => {
-                    self.quit_from_tray = true;
+                    // 托盘线程还会直接给主窗口发 WM_CLOSE（窗口隐藏时也有效）
                     want_close = true;
                 }
             }
@@ -725,27 +723,10 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        // 托盘「退出」也可能只写了共享标志（窗口隐藏时通道事件可能没人收）
-        if self.tray_quit.load(Ordering::Relaxed) && !self.quit_from_tray {
-            self.quit_from_tray = true;
-            self.push_log("托盘菜单请求退出".into());
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-
-        // ---- 点关窗 = 缩到托盘；托盘菜单「退出」才真正退出 ----
-        if ctx.input(|i| i.viewport().close_requested())
-            && self.tray.is_some()
-            && !self.quit_from_tray
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            if !self.hidden_to_tray {
-                self.hidden_to_tray = true;
-                self.push_log(
-                    "已收进系统托盘：双击托盘图标恢复；右键菜单里有「退出」".to_string(),
-                );
-            }
-        }
+        // 关窗语义（2026-10-25 按用户要求定）：
+        //   · 点窗口 X  ⇒ **直接退出**（不拦截 close_requested，也不 CancelClose）；
+        //   · 收进托盘  ⇒ 只有顶栏「收进托盘」按钮 / 托盘菜单的「显示主窗口」才走隐藏。
+        // 退出前 on_exit 会保存配置并删掉托盘图标。
 
         // ---- 换机/换人使用时的一次性自适应 ----
         // 配置是**按 Windows 账号 + 本机**存的（%LOCALAPPDATA%），换台机器/换个用户

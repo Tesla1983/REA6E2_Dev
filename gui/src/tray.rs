@@ -6,8 +6,9 @@
 //! - 线程里建一个**隐藏的顶层窗口**（不能用 HWND_MESSAGE：`TrackPopupMenu` 在
 //!   message-only 窗口上不可靠）作为托盘回调的宿主。
 //! - 和 UI 之间只用一条 mpsc 通道传 `TrayEvent`，UI 每帧 `try_recv` 一次。
-//! - 关闭窗口时默认**缩到托盘**而不是退出；托盘菜单「退出」才真正结束进程
-//!   （见 `app.rs` 里对 `close_requested` 的处理）。
+//! - 关窗语义（2026-10-25 定）：**点窗口 X = 直接退出**；只有顶栏「收进托盘」按钮
+//!   才会把窗口隐藏到托盘（隐藏后双击托盘图标/菜单「显示主窗口」可恢复）。
+//!   App 侧不再拦截 `close_requested`，所以 X 和托盘菜单「退出」都是正常关闭流程。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
