@@ -97,6 +97,8 @@ pub struct App {
     /// 正在变化中的偏好 + 最后一次变化的时刻（去抖：停手 600ms 再写盘）
     pending: Settings,
     last_change: Option<Instant>,
+    /// 是否已经按本机屏幕做过一次"夹取"（只做一次，别跟用户手动拖动打架）
+    screen_checked: bool,
 }
 
 impl App {
@@ -139,6 +141,7 @@ impl App {
             saved,
             pending: saved,
             last_change: None,
+            screen_checked: false,
         };
         app.push_log(format!("中文字体: {}", app.font_note.clone()));
         app.push_log(format!("界面缩放: {:.0}%", app.zoom * 100.0));
@@ -515,6 +518,18 @@ fn build_visuals() -> egui::Visuals {
 
 /// 界面设置的落盘位置：`%LOCALAPPDATA%\Ra6e2Monitor\ui.json`
 fn settings_path() -> std::path::PathBuf {
+    // 便携模式：**exe 同目录若已存在 ui.json，就优先用它**（设置随程序目录走，
+    // 拷给别人时连版面/缩放一起带过去）。只认"已存在"，避免往 Program Files
+    // 这种只读目录里尝试写文件。
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("ui.json");
+            if p.is_file() {
+                return p;
+            }
+        }
+    }
+    // 默认：按 Windows 账号 + 本机各存一份（标准做法，换人/换机互不影响）
     let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
     std::path::PathBuf::from(base).join("Ra6e2Monitor").join("ui.json")
 }
@@ -576,7 +591,13 @@ impl Settings {
             ),
             None => format!("{{\"zoom\":{}}}", self.zoom),
         };
-        let _ = std::fs::write(p, text);
+        // 原子写：先写临时文件再替换。直接 fs::write 半路断电会留下被截断的 JSON
+        // （读的时候虽然有兜底，但那等于把用户设置丢了）。
+        let tmp = p.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::remove_file(&p);        // Windows 的 rename 不覆盖已存在文件
+            let _ = std::fs::rename(&tmp, &p);
+        }
     }
 }
 
@@ -598,6 +619,44 @@ impl eframe::App for App {
     /// 面板也统一成 `egui::Panel`（SidePanel/TopBottomPanel 已合并）。
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // ---- 换机/换人使用时的一次性自适应 ----
+        // 配置是**按 Windows 账号 + 本机**存的（%LOCALAPPDATA%），换台机器/换个用户
+        // 会用自己的默认值，这没问题；但"别处存下的大尺寸/大缩放"如果被带过来，
+        // 在小屏上会开出屏外或把界面裁掉。这里按本机显示器夹一次（只做一次）。
+        if !self.screen_checked {
+            if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
+                self.screen_checked = true;
+
+                // 窗口别超过显示器 90%
+                let max_w = (m.x * 0.90).max(840.0);
+                let max_h = (m.y * 0.90).max(540.0);
+                if let Some((w, h)) = Self::current_settings(&ctx).window {
+                    if w > max_w || h > max_h {
+                        let nw = w.min(max_w);
+                        let nh = h.min(max_h);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(nw, nh)));
+                        self.push_log(format!(
+                            "本机屏幕 {:.0}×{:.0}，窗口已从 {:.0}×{:.0} 夹到 {:.0}×{:.0}",
+                            m.x, m.y, w, h, nw, nh
+                        ));
+                    }
+                }
+
+                // 缩放别大到连"最小窗口"(840×540) 都放不下，否则左右面板会被裁
+                let max_zoom = (max_w / 840.0).min(max_h / 540.0).clamp(0.6, 2.5);
+                let z = ctx.zoom_factor();
+                if z > max_zoom + 1e-3 {
+                    ctx.set_zoom_factor(max_zoom);
+                    self.zoom = max_zoom;
+                    self.push_log(format!(
+                        "本机屏幕放不下 {:.0}% 缩放，已限制为 {:.0}%",
+                        z * 100.0,
+                        max_zoom * 100.0
+                    ));
+                }
+            }
+        }
 
         // 把 UI 上的勾选同步给工作线程
         if let Ok(mut m) = self.mask_shared.lock() {
