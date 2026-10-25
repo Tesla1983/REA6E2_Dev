@@ -22,3 +22,6 @@ fb_ascii.txt
 
 # ===== 工具 / agent 项目数据 =====
 .workbuddy/
+
+# ===== 搁置的驱动绑定 INF（实测无法消除 30s 出 COM，仅作本地参考）=====
+docs/ra6e2_cdc.inf
