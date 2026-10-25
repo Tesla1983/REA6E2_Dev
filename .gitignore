@@ -23,9 +23,6 @@ fb_ascii.txt
 # ===== 工具 / agent 项目数据 =====
 .workbuddy/
 
-# ===== 搁置的驱动绑定 INF（实测无法消除 30s 出 COM，仅作本地参考）=====
-docs/ra6e2_cdc.inf
-
 # ===== 本地开发文档与配图（不进仓库，仅本地参考；docs/立创地奇星RA6E2/ 仍跟踪）=====
 docs/*.md
 docs/assets/
