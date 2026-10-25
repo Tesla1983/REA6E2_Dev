@@ -1,3 +1,5 @@
+> 其它语言：[English](README_EN.md)
+
 # RA6E2 系统监控屏
 
 基于 Renesas RA6E2 开发板的「PC 系统监控外设」：一块 128×64 单色点阵屏实时显示本机

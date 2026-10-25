@@ -1,3 +1,5 @@
+> Other languages: [中文](README.md)
+
 # RA6E2 System Monitor Display
 
 A "PC system monitor peripheral" built on a Renesas RA6E2 development board: a 128×64
