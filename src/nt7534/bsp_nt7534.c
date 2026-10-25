@@ -91,15 +91,14 @@ static void nt_pins_as_output(void)
 
 /* ---------------- 底层传输 ---------------- */
 
-/** 半位延时: 用 NOP 循环, 不用 R_BSP_SoftwareDelay。
- *  实测 R_BSP_SoftwareDelay(1, MICROSECONDS) 单次开销远大于 1 µs（整屏一帧要 ~3 s,
- *  折合 300~400 µs/字节）, 完全是它的函数调用与校准开销, 这里改成 ~16 次空转,
- *  半位约 300~400 ns → 约 1.2~1.6 Mbit/s, 对 NT7534 这类控制器仍很保守。 */
+/** 半位延时: 用少量空转控制 NOP 数(不用 R_BSP_SoftwareDelay, 其单次开销太大)。
+ *  ⚠ 实测 volatile 16 次空转整屏要 ~30ms(≈273 kbit/s, 远低于 NT7534 可接受的 1.2–1.6 Mbit/s),
+ *    说明延时被高估了。降到 4 次 → 约 1.1 Mbit/s(仍在保守范围内), 整屏 ~7–8ms, 可支撑 ~30fps。 */
 static void nt_half_delay(void)
 {
     volatile uint32_t i;
 
-    for (i = 0u; i < 16u; i++)
+    for (i = 0u; i < 4u; i++)
     {
         __asm__ volatile ("nop");
     }

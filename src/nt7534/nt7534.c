@@ -12,6 +12,7 @@
 #include "cgc/osc_probe.h"             /* 20MHz 晶振起振探测(USB 时钟可行性) */
 #include "nt7534/bsp_nt7534.h"
 #include "nt7534/u8g2_port.h"     /* u8g2 移植层: 真 ° 字形 + 线段/矩形/圆 */
+#include "nt7534/fan_frames.h"    /* 3 叶 20x20 风扇位图帧(24 帧, scripts/gen_fan_frames.py 生成) */
 #include "oled/bsp_oled.h"             /* 1.3" OLED 兼作"第二指示灯" */
 #include "rtt/rtt_log.h"
 #include "uart/bsp_uart_link.h"        /* 上位机数据（SCI0 / USB CDC 共用解析） */
@@ -201,26 +202,6 @@ static void num4(char * p, size_t n, int16_t v)
     (void) snprintf(p, n, "%4d", (int) v);
 }
 
-/** 画一行 `CPU 48°C 12% 1050`。
- *  ° 是 u8g2 字体里真实存在的字形(U+00B0), 不再是拼出来的小圈,
- *  所以它相对 C 的位置由字体决定, 不会"偏左偏右"。 */
-static void draw_metric_row(u8g2_t * g, int16_t y, const char * p_label,
-                            int16_t temp, int16_t usage, int16_t fan)
-{
-    char ts[8];
-    char us[8];
-    char fs[8];
-    char line[32];
-
-    num2(ts, sizeof(ts), temp);
-    num2(us, sizeof(us), usage);
-    num4(fs, sizeof(fs), fan);
-
-    (void) snprintf(line, sizeof(line), "%s %s" U8G2_DEG_C " %s%% %s",
-                    p_label, ts, us, fs);
-    u8g2_DrawUTF8(g, 0, y, line);
-}
-
 /** USB 中断链"三段自证"。
  *
  *  目的: 当调试器连不上时, 这块屏是唯一还能读的观测窗。USBFS 中断不进 CPU
@@ -264,27 +245,143 @@ static void draw_usb_diag(u8g2_t * g)
     u8g2_DrawUTF8(g, 0, 48, line);
 }
 
-/** 画方案 A 的一帧（真实数据, 来自串口链路）。
- *  行 0 CPU / 行 1 GPU / 行 2 RAM / 行 3 链路状态, 行距 16 px。 */
+/* ===== 表格版布局 + 风扇（2026-10-25 定稿）=====
+ *
+ * 表格(128x64):  竖线 x=0/24/54/86/119, 横线 y=0/16/32/47(仅左半)/63;
+ *   第 3、4 行的右侧为两个风扇格(纵向合并 y=32..62), 格顶标 CPU / GPU。
+ *   所有单元格文字水平+垂直居中。
+ *   linked 行(x=0..54) 不画 x=24 竖线 ⇒ 不被竖线穿过。
+ *
+ * 风扇: 3 叶 20x20 位图帧(24 帧 = 120° 视觉周期)。相位按 RPM 实时推进 ——
+ *   角速度 = RPM/24 度/秒, 与上位机送数频率(1 Hz 也好、别的也好)**完全解耦**;
+ *   数据只更新 RPM 值; 动画由主循环 2ms 切片计数自行推进(DWT 在本 M33 上不计, 不用)。
+ */
+
+/** 两台风扇的相位, 单位 1/100 度。3 叶对称周期 120° = 12000 cd = 24 帧。 */
+static int32_t  s_fan_phase_cd[2] = { 0, 0 };
+
+/** 按 RPM 推进两台风扇相位: 角速度 = RPM/24 (°/s) ⇒ 每 ms 增加 RPM/240 (1/100°)。 */
+static void fan_advance(uint32_t dt_ms)
+{
+    const uart_link_data_t * d = UART_Link_Data();
+    int32_t v[2];
+    int     i;
+
+    v[0] = (d->cf < 0) ? 0 : ((d->cf > 3000) ? 3000 : d->cf);
+    v[1] = (d->gf < 0) ? 0 : ((d->gf > 3000) ? 3000 : d->gf);
+
+    for (i = 0; i < 2; i++)
+    {
+        int32_t inc = (v[i] * (int32_t) dt_ms) / 240;
+        int32_t ph  = s_fan_phase_cd[i] + inc;
+        if (ph >= 12000)
+        {
+            ph %= 12000;
+        }
+        s_fan_phase_cd[i] = ph;
+    }
+}
+
+/** 在 (ox,oy) 画 20x20 风扇, 取 phase 对应的位图帧。 */
+static void draw_fan(u8g2_t * g, int16_t ox, int16_t oy, int32_t phase_cd)
+{
+    int idx = (int) ((phase_cd / 500) % FAN_FRAME_COUNT);
+    u8g2_DrawXBMP(g, (u8g2_uint_t) ox, (u8g2_uint_t) oy,
+                  FAN_FRAME_W, FAN_FRAME_H, g_fan_frames[idx]);
+}
+
+/** 在 [x0..x1]×[y0..y1] 单元格内水平+垂直居中绘制文本(FontPosTop)。 */
+static void draw_cell(u8g2_t * g, const char * s,
+                      int16_t x0, int16_t x1, int16_t y0, int16_t y1)
+{
+    int16_t      cw = (int16_t) (x1 - x0 + 1);
+    int16_t      ch = (int16_t) (y1 - y0 + 1);
+    int16_t      fh = (int16_t) (u8g2_GetAscent(g) - u8g2_GetDescent(g));
+    u8g2_uint_t  w  = u8g2_GetUTF8Width(g, s);
+    int16_t      x  = (int16_t) (x0 + (cw - (int16_t) w) / 2);
+    int16_t      y  = (int16_t) (y0 + (ch - fh) / 2);
+
+    if (x < x0) { x = x0; }
+    if (y < y0) { y = y0; }
+    u8g2_DrawUTF8(g, (u8g2_uint_t) x, (u8g2_uint_t) y, s);
+}
+
+/** 自绘 5x7 小字(仅 C/P/U/G), 用于风扇格标签——比 7x13 小, 放得下且不压线。
+ *  每个字形 7 行, 每行低 5 位有效(bit4 在左)。纯置位绘制, 不清背景。 */
+static const uint8_t g_glyph_C[7] = { 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E };
+static const uint8_t g_glyph_P[7] = { 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10 };
+static const uint8_t g_glyph_U[7] = { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E };
+static const uint8_t g_glyph_G[7] = { 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E };
+
+static const uint8_t * small_glyph(char ch)
+{
+    switch (ch)
+    {
+        case 'C': return g_glyph_C;
+        case 'P': return g_glyph_P;
+        case 'U': return g_glyph_U;
+        case 'G': return g_glyph_G;
+        default:  return NULL;
+    }
+}
+
+/** 用 5x7 小字在 [x0..x1] 内水平居中, 从 ytop 起画一行标签(CPU / GPU)。 */
+static void draw_small_label(u8g2_t * g, const char * s,
+                             int16_t x0, int16_t x1, int16_t ytop)
+{
+    int16_t n = 0;
+    int16_t total;
+    int16_t x;
+    int16_t i;
+    int     row;
+    int     col;
+
+    while (s[n] != '\0') { n++; }
+    total = (int16_t) (n * 6 - 1);
+    x     = (int16_t) (x0 + ((x1 - x0 + 1) - total) / 2);
+
+    for (i = 0; i < n; i++)
+    {
+        const uint8_t * gl = small_glyph(s[i]);
+        if (gl != NULL)
+        {
+            for (row = 0; row < 7; row++)
+            {
+                for (col = 0; col < 5; col++)
+                {
+                    if (0u != (gl[row] & (uint8_t) (0x10u >> col)))
+                    {
+                        u8g2_DrawPixel(g, (u8g2_uint_t) (x + col),
+                                       (u8g2_uint_t) (ytop + row));
+                    }
+                }
+            }
+        }
+        x = (int16_t) (x + 6);
+    }
+}
+
+/** 画一帧表格版界面(真实数据, 来自串口/USB CDC 链路)。 */
 static void draw_layout_a(void)
 {
     static u8g2_t         * g = NULL;
     const uart_link_data_t * d = UART_Link_Data();
-    char                    line[24];
-    char                    ms[8];
+    char                    s[16];
+    char                    t[8];
+    char                    u[8];
+    char                    r[8];
 
     if (NULL == g)
     {
-        /* 第一次调用时才初始化: 让屏幕上电到出第一帧之间不留空白 */
         g = U8G2_Port_Init();
         u8g2_SetFont(g, u8g2_font_7x13_tf);
-        u8g2_SetFontPosTop(g);      /* DrawStr 的 y 变成"顶部"而不是基线 */
+        u8g2_SetFontPosTop(g);      /* y 变成"顶部"而不是基线 */
+        u8g2_SetFontMode(g, 1);     /* 透明: 只置位、不清背景(否则会擦断表格线/风扇) */
     }
 
     u8g2_ClearBuffer(g);
 
-    /* 一条数据通路都没通的时候, 三行指标本来也只能显示 `--`, 不如把画面让给
-     * USB 中断链的三段自证（见 draw_usb_diag 的注释）。任一路通了就自动换回指标。 */
+    /* 一条数据通路都没通的时候, 把画面让给 USB 中断三段自证(见 draw_usb_diag)。 */
     if (!UART_Link_Online() && !USB_CDC_Configured())
     {
         draw_usb_diag(g);
@@ -292,18 +389,56 @@ static void draw_layout_a(void)
         return;
     }
 
-    draw_metric_row(g, 0,  "CPU", d->ct, d->cu, d->cf);
-    draw_metric_row(g, 16, "GPU", d->gt, d->gu, d->gf);
+    /* --- 表格线 --- */
+    u8g2_DrawHLine(g, 0, 0, 120);
+    u8g2_DrawHLine(g, 0, 16, 120);
+    u8g2_DrawHLine(g, 0, 32, 120);
+    u8g2_DrawHLine(g, 0, 47, 55);       /* 仅左半: 右侧风扇格纵向合并 */
+    u8g2_DrawHLine(g, 0, 63, 120);
+    u8g2_DrawVLine(g, 0, 0, 64);
+    u8g2_DrawVLine(g, 24, 0, 47);       /* linked 行特意不画, 免得穿过文字 */
+    u8g2_DrawVLine(g, 54, 0, 64);
+    u8g2_DrawVLine(g, 86, 0, 64);
+    u8g2_DrawVLine(g, 119, 0, 64);
 
-    num2(ms, sizeof(ms), d->mu);
-    (void) snprintf(line, sizeof(line), "RAM %s%%", ms);
-    u8g2_DrawUTF8(g, 0, 32, line);
+    /* --- CPU 行 --- */
+    draw_cell(g, "CPU", 1, 23, 1, 15);
+    num2(t, sizeof(t), d->ct);
+    if (d->ct < 0) { (void) snprintf(s, sizeof(s), "--"); }
+    else           { (void) snprintf(s, sizeof(s), "%s" U8G2_DEG_C, t); }
+    draw_cell(g, s, 25, 53, 1, 15);
+    num2(u, sizeof(u), d->cu);
+    (void) snprintf(s, sizeof(s), "%s%%", u);
+    draw_cell(g, s, 55, 85, 1, 15);
+    num4(r, sizeof(r), d->cf);
+    draw_cell(g, r, 87, 118, 1, 15);
 
-    /* 状态行: 只显示链路连通状态。
-     *   linked = 最近 2 s 内收到过有效帧（UART_Link_Online()）
-     *   unlink = 没收到（上位机没发、或线没通）
-     * ⚠ 固件版本号已按需求从屏上移除；要看版本仍可读 g_nt_fw_tag 或 RTT 日志。 */
-    u8g2_DrawUTF8(g, 0, 48, UART_Link_Online() ? "linked" : "unlink");
+    /* --- GPU 行 --- */
+    draw_cell(g, "GPU", 1, 23, 17, 31);
+    num2(t, sizeof(t), d->gt);
+    if (d->gt < 0) { (void) snprintf(s, sizeof(s), "--"); }
+    else           { (void) snprintf(s, sizeof(s), "%s" U8G2_DEG_C, t); }
+    draw_cell(g, s, 25, 53, 17, 31);
+    num2(u, sizeof(u), d->gu);
+    (void) snprintf(s, sizeof(s), "%s%%", u);
+    draw_cell(g, s, 55, 85, 17, 31);
+    num4(r, sizeof(r), d->gf);
+    draw_cell(g, r, 87, 118, 17, 31);
+
+    /* --- RAM 行 --- */
+    draw_cell(g, "RAM", 1, 23, 33, 46);
+    num2(u, sizeof(u), d->mu);
+    (void) snprintf(s, sizeof(s), "%s%%", u);
+    draw_cell(g, s, 25, 53, 33, 46);
+
+    /* --- 状态行(独占 x0..54, 不被竖线穿过) --- */
+    draw_cell(g, UART_Link_Online() ? "linked" : "unlink", 1, 53, 48, 62);
+
+    /* --- 右下角风扇格: 顶部 5x7 小字标签(y34, 离横线2px/离风扇2px) + 20x20 风扇 --- */
+    draw_small_label(g, "CPU", 55, 85, 34);
+    draw_fan        (g, 60, 43, s_fan_phase_cd[0]);
+    draw_small_label(g, "GPU", 87, 118, 34);
+    draw_fan        (g, 93, 43, s_fan_phase_cd[1]);
 
     U8G2_Port_Flush();
 }
@@ -622,6 +757,22 @@ void NT7534_Run(void)
                 UART_Link_Poll();
                 UART_Link_Tick(50u);
             }
+#if (0 != U8G2_PORT_ENABLE)
+            /* 风扇动画重绘: 每 11 片(≈22ms)+刷屏≈30fps, 与上位机送数频率解耦。
+             * 节拍用 2ms 切片计数(DWT 在本 M33 上不计, 已弃用)。
+             * 发送层半位延时已降(16→4), 整屏刷新 ~7-8ms, 故可撑到 30fps。
+             * 门控: 有有效 RPM 数值(cf/gf>=0)就转, 无数据(-1)则静止。
+             * 观感偏慢 ⇒ 每帧推进量 ×1.5(≈50ms 对应 1.5 倍速)。 */
+            if (0u == (k % 11u))
+            {
+                const uart_link_data_t * pd = UART_Link_Data();
+                if ((pd->cf >= 0) || (pd->gf >= 0))
+                {
+                    fan_advance(50u);
+                    draw_layout_a();
+                }
+            }
+#endif
         }
     }
 }
