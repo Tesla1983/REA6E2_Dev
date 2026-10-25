@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# 烧录固件到 RA6E2 (probe-rs + DAPLink)
+# 烧录固件到 RA6E2 (probe-rs + FireDAP CMSIS-DAP)
 #
 #   ./scripts/flash.sh                 # 烧录 build/ra6e2_fw.elf (6.6.0 产物)
 #   ./scripts/flash.sh --verify        # 烧录并回读校验
@@ -11,9 +11,10 @@
 #   `probe-rs reset` 只复位内核、不重走 USB 枚举, 实测会把 COM15 弄没。
 #   要跑固件请**物理拔插 Type-C**。确实要探针复位才加 `--reset`。
 #
-# 推荐配方 (2026-10-23 唯一验证过能成的):
-#   ./scripts/flash.sh --probe 0d28:0204 --speed 400 --no-dblbuf --verify
-#   且: 探针刚断电复活后**立刻烧**, 中间不要插任何 probe-rs read/info 诊断。
+# 推荐配方 (2026-10-25 起, FireDAP 为唯一探针; 实测可成):
+#   ./scripts/flash.sh --speed 1000 --verify
+#   (探针就是默认值 0416:5021, 不用再写 --probe)
+#   不稳时依次: --speed 400 --no-dblbuf   → --speed 100 --no-dblbuf
 #
 # 安全闸门: 默认拒绝烧录「含 option-setting 段」的 elf。
 #   6.6.0 产物 (build/) 不含这些段 —— 烧它绝不会碰 0x0100A100 区, 不会锁死 SWD。
@@ -21,12 +22,14 @@
 #   脚本会自动补 --skip-section 跳过它们。详见文档 §6.0。
 #
 # ⚠ 会擦除片上现有程序。执行前确认板是 RA6E2 那一块。
-# ⚠⚠ 探针: **必须显式指定**（RA_PROBE 环境变量或 --probe）。没有默认值。
-#   原因: 本机 DAPLink(0d28:0204) 与 Pico2(2e8a:000c) 都曾"插着但用不了",
-#   给默认值会让人以为烧成功了其实压根没连上。要看当前哪些探针活着:
+# ⚠⚠ 探针 (2026-10-25 用户最新确立, 覆盖此前"禁止 FireDAP"的旧规矩):
+#   当前机器上**只有 FireDAP(0416:5021)** 这一个可用探针, 所以
+#   **烧哪个开发板都用它**(RA6E2 / STM32H743 等一律如此), 它就是默认值。
+#   旧说明(DAPLink 0d28:0204 为唯一可用、FireDAP 禁用)已作废 —— 那只 DAPLink 已不在本机。
+#   仍可显式指定别探针: RA_PROBE=<vid:pid> 或 --probe <vid:pid>。
+#   要看当前哪些探针活着:
+#       probe-rs list
 #       python tools/board_id.py
-#       python tools/daplink_probe.py          # 单测 0d28 的 DAP 命令引擎
-# ⚠ FireDAP(0416:5021) 是 STM32H743 自带的, 禁止拿它烧 RA6E2。
 # ⚠ ESP32-S3(303a:1001) 只有 ESP 的 flash 算法, 烧不了 RA6E2。
 # ============================================================
 set -euo pipefail
@@ -41,7 +44,7 @@ OBJDUMP="$(command -v arm-none-eabi-objdump || true)"
 [[ -z "$OBJDUMP" ]] && OBJDUMP="E:/software/ArmGNUToolchain/14.3 rel1/bin/arm-none-eabi-objdump.exe"
 
 CHIP="R7FA6E2BB"          # 256 KB flash 变体
-PROBE="${RA_PROBE:-}"     # 无默认值: 见文件头说明
+PROBE="${RA_PROBE:-0416:5021}"   # 默认 FireDAP: 本机当前唯一可用探针(见文件头)
 ELF="$ROOT/build/ra6e2_fw.elf"
 
 VERIFY=0
@@ -81,11 +84,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$PROBE" ]]; then
-    echo "✘ 没有指定探针。当前本机没有任何『默认可信』的探针 ——" 1>&2
-    echo "  DAPLink 0d28:0204 已于 2026-10-23 下午失效（HID 命令引擎不响应），" 1>&2
-    echo "  不能再当默认。用法:" 1>&2
-    echo "      RA_PROBE=<vid:pid> ./scripts/flash.sh" 1>&2
-    echo "      ./scripts/flash.sh --probe <vid:pid>" 1>&2
+    echo "✘ 没有指定探针。当前本机唯一可用探针是 FireDAP(0416:5021):" 1>&2
+    echo "      ./scripts/flash.sh --probe 0416:5021 ..." 1>&2
     echo "" 1>&2
     echo "  当前 probe-rs 能看到的:" 1>&2
     "$PR" list 2>&1 | sed 's/^/      /' 1>&2

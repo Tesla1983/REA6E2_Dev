@@ -49,6 +49,30 @@ volatile uint32_t g_usb_req_cnt      = 0u;
 volatile uint32_t g_usb_req_done_cnt = 0u;
 volatile uint32_t g_usb_req_last     = 0u;
 
+/* ---- 2026-10-25 新增：类请求环形日志 ----
+ *
+ * 背景（实测，见 scripts/measure_com_delay.ps1 的三口径计时）：
+ *   PnP 建好 COM17 devnode 只要 **0.34 s**，状态全程 OK/CM_PROB_NONE；
+ *   但 COM 口登记进 SERIALCOMM 要 **29.4 s**，且首次能打开也是 28.9 s
+ *   ⇒ 不是"能打开但扫描不到"，端口是真的 29 s 才可用。
+ *   对照组 CH340(VID_1A86) 同样拔插：SERIALCOMM **0.37 s** 就好
+ *   ⇒ 不是 Windows 通用行为，是**本设备 + usbser** 特有。
+ *   29 s 这个数字与本项目 v15 的 30.00 s 超时同量级，怀疑仍是某个控制请求没收尾。
+ *
+ * 用法：烧录后拔插，等 ~35 s（端口已可用），再用 probe-rs 读这些全局量
+ *      （符号地址每次重编译都会变，读前必须重新 nm），看最后一条是什么请求。
+ */
+#define USB_REQ_LOG_N   16u
+volatile uint32_t g_usb_req_log_head   = 0u;                    /**< 下一条要写的位置 */
+volatile uint8_t  g_usb_req_log_bmrt   [USB_REQ_LOG_N];         /**< bmRequestType */
+volatile uint8_t  g_usb_req_log_breq   [USB_REQ_LOG_N];         /**< bRequest */
+volatile uint16_t g_usb_req_log_value  [USB_REQ_LOG_N];         /**< wValue */
+volatile uint16_t g_usb_req_log_index  [USB_REQ_LOG_N];         /**< wIndex */
+volatile uint16_t g_usb_req_log_length [USB_REQ_LOG_N];         /**< wLength（关键：>0 就有数据阶段） */
+volatile uint32_t g_usb_req_log_seq    [USB_REQ_LOG_N];         /**< 当时的 g_usb_req_cnt */
+volatile uint32_t g_usb_req_nodata_cnt = 0u;                    /**< 走“无数据”收尾的次数 */
+volatile uint32_t g_usb_req_data_cnt   = 0u;                    /**< 走了数据阶段的次数（本轮新增） */
+
 /* ---- v15 新增：控制传输"阶段"诊断（用来判定状态阶段到底完没完） ----
  *
  * USBFS 的 INTSTS0.CTRT[15:13] 是**控制传输阶段**状态机：
@@ -202,6 +226,12 @@ volatile uint32_t        g_usb_read_arm_cnt = 0u;
 /* CDC 的 7 字节线路编码（GET_LINE_CODING 的应答 / SET_LINE_CODING 的接收缓冲）。
  * 默认 115200 8N1：dwDTERate=115200(0x0001C200 小端) / bCharFormat=0 / bParityType=0 / bDataBits=8 */
 static uint8_t           s_line_coding[7] = { 0x00u, 0xC2u, 0x01u, 0x00u, 0x00u, 0x00u, 0x08u };
+
+/* 2026-10-25: "其它类请求"的数据阶段暂存区。
+ * 用于那些我们本来不认识、但**带数据阶段**的请求（如 GET_ENCAPSULATED_RESPONSE），
+ * 避免按"无数据"收尾导致主机干等 ~30 s 超时。64 字节覆盖常见控制请求长度。 */
+#define USB_REQ_SCRATCH_N   64u
+static uint8_t           s_req_scratch[USB_REQ_SCRATCH_N];
 
 volatile uint32_t g_usb_open_err = 0xFFFFFFFFu;
 volatile uint32_t g_usb_events   = 0u;
@@ -427,6 +457,21 @@ static void usb_serial_state_service(void)
     }
 }
 
+/* 应用层 USB 描述符表里的 MS OS 2.0 描述符集(CompatID=CDCACM), 用于应答 Windows 的
+ * vendor 请求(0xC0 / bRequest=0x01 / wIndex=0x0007)。
+ *
+ * ⚠⚠ 惰性兜底, 当前**不会被执行**, 且原定目标已被证伪 —— 勿据此再动固件:
+ *   1) 只有 bcdUSB>=0x0201 时 Windows 才会请求 BOS 并发这条 vendor 请求; 本项目
+ *      USB_BCDNUM 固定 0x0200, 所以下面这段代码永不触发。
+ *   2) 实测(2026-10-25)升 0x0201 启用 BOS 两次(外置 / 内嵌描述符集)都导致 Windows 把
+ *      设备标记为 CM_PROB_FAILED_START, 比"慢 30s"更糟。
+ *   3) 而且那 30s 已被证明与"驱动查询"无关: devnode 0.9s 就绑好 usbser 并 OK,
+ *      之后 USB 总线静默 30s, 是主机内部 usbser/msports 的 COM 名登记延迟(固件无责)。
+ *   详见 usb_cdc_descriptor.c 文件头的完整结论。将来若升级 FSP 想重试, 改 USB_BCDNUM 即可。
+ *
+ * 大小 46 = BOS 描述符里声明的 wMSOSDescriptorSetTotalLength (0x2E), 二者必须一致。 */
+extern uint8_t g_apl_msos20_set[46];
+
 /** USB 事件回调（BSP_CFG_RTOS=0 时签名是 void (*)(usb_callback_args_t *)） */
 void usb_callback(usb_callback_args_t * p_args)
 {
@@ -476,6 +521,18 @@ void usb_callback(usb_callback_args_t * p_args)
 
             g_usb_req_cnt++;
             g_usb_req_last = p_args->setup.request_type;
+
+            /* 环形日志：把这次请求的完整 SETUP 字段记下来（事后用 probe-rs 读） */
+            {
+                uint32_t h = g_usb_req_log_head;
+                g_usb_req_log_bmrt  [h] = (uint8_t) (p_args->setup.request_type & 0xFFU);
+                g_usb_req_log_breq  [h] = breq;
+                g_usb_req_log_value [h] = p_args->setup.request_value;
+                g_usb_req_log_index [h] = p_args->setup.request_index;
+                g_usb_req_log_length[h] = p_args->setup.request_length;
+                g_usb_req_log_seq   [h] = g_usb_req_cnt;
+                g_usb_req_log_head      = (h + 1u) % USB_REQ_LOG_N;
+            }
 
             /* ⚠⚠ v15 关键修正：**不要再"每个类请求都乱开 pipe0 中断"**。
              *
@@ -566,11 +623,69 @@ void usb_callback(usb_callback_args_t * p_args)
                  * 没有它，这个请求的状态阶段永远发不出去 ⇒ open/close 各卡 30 s。 */
                 usb_pipe0_nodata_arm();
             }
+            else if ((0x01 == breq) &&
+                     (0xC0 == (uint8_t) (p_args->setup.request_type & 0xFFU)) &&
+                     (0x0007 == p_args->setup.request_index))
+            {
+                /* Microsoft OS 2.0 描述符集请求: vendor 读(bmRequestType=0xC0,
+                 * bRequest=bMS_VendorCode=0x01, wIndex=0x0007)。回 CompatID="CDCACM"
+                 * 的描述符集(见 usb_cdc_descriptor.c 的 g_apl_msos20_set)。
+                 * ⚠ 惰性兜底: 只有 bcdUSB>=0x0201 时才会触发, 当前 0x0200 永不执行;
+                 *   且实测启用 BOS 会导致设备 CM_PROB_FAILED_START, 详见文件头注释。
+                 * 长度取主机请求与描述符集的较小值。 */
+                uint16_t want = p_args->setup.request_length;
+                uint16_t have = (uint16_t) sizeof(g_apl_msos20_set);
+                uint16_t len  = (want < have) ? want : have;
+                usb_pipe0_ctrl_isr_arm();                      /* 先清陈旧位, 再开中断 */
+                g_usb_get_err = (uint32_t) R_USB_PeriControlDataGet(&g_basic0_ctrl,
+                                                                     g_apl_msos20_set, len);
+            }
             else
             {
-                /* 其它类请求在固件里没有数据阶段处理 ⇒ 同样按"无数据"收尾，
-                 * 否则会和 0x22 一样把状态阶段挂住。 */
-                usb_pipe0_nodata_arm();
+                /* 2026-10-25 修正：以前这里**无条件**按"无数据"收尾。
+                 * 带数据阶段的请求(bRequest 非 0x20/0x21/0x22 且 wLength>0, 例如
+                 * 0x01 GET_ENCAPSULATED_RESPONSE / 0x00 SEND_ENCAPSULATED_COMMAND)
+                 * 若被当成"无数据"处理, 主机会永远等不到数据 ⇒ 干等超时。
+                 *
+                 * ⚠ 但事后用请求日志验证: **本设备从未收到这类请求** —— 枚举全程只有
+                 *   4 条标准 CDC 请求, g_usb_req_data_cnt 始终为 0。所以它不是"COM 口
+                 *   晚 29.6s"的原因(那条另有出处, 见 usb_cdc_descriptor.c 文件头)。
+                 *   这个修正仍保留: 它本身是正确且无害的健壮性改进(避免将来遇到带数据
+                 *   阶段的请求时把控制传输挂死), 但**不要**再把它当成 30s 的解释。
+                 *
+                 * ⇒ 现在按 wLength 与方向分别处理：
+                 *     wLength == 0            → 维持原来的"无数据"收尾
+                 *     IN (bmRequestType&0x80) → 回 wLength 字节（填 0）
+                 *     OUT                     → 收下 wLength 字节
+                 */
+                uint16_t wlen = p_args->setup.request_length;
+                uint8_t  bmrt = (uint8_t) (p_args->setup.request_type & 0xFFU);
+
+                if (0u == wlen)
+                {
+                    usb_pipe0_nodata_arm();
+                    g_usb_req_nodata_cnt++;
+                }
+                else
+                {
+                    uint16_t len = (wlen < USB_REQ_SCRATCH_N) ? wlen : (uint16_t) USB_REQ_SCRATCH_N;
+                    uint16_t i;
+
+                    for (i = 0u; i < len; i++)
+                    {
+                        s_req_scratch[i] = 0u;
+                    }
+                    usb_pipe0_ctrl_isr_arm();                  /* 先清陈旧位, 再开中断 */
+                    g_usb_req_data_cnt++;
+                    if (0u != (bmrt & 0x80U))
+                    {
+                        (void) R_USB_PeriControlDataGet (&g_basic0_ctrl, s_req_scratch, len);
+                    }
+                    else
+                    {
+                        (void) R_USB_PeriControlDataSet (&g_basic0_ctrl, s_req_scratch, len);
+                    }
+                }
             }
             break;
         }
@@ -653,6 +768,14 @@ fsp_err_t USB_CDC_Init(void)
                                                     (uint32_t) IOPORT_PERIPHERAL_USB_FS);
     R_BSP_SoftwareDelay(2u, BSP_DELAY_UNITS_MILLISECONDS);
 #endif
+
+    /* 用芯片出厂 UID 填充 USB 序列号(每块板唯一), 必须在 R_USB_Open 之前完成
+     * (枚举时主机才读 string 6)。否则写死序列号会让 Windows 无法区分设备,
+     * 每次重连都重建 devnode、重走"设备安装"流程 —— 表现就是"重启后等十几秒才出 COM"。 */
+    {
+        extern void usb_cdc_fill_serial_from_uid(void);
+        usb_cdc_fill_serial_from_uid();
+    }
 
     err = R_USB_Open(&g_basic0_ctrl, &g_basic0_cfg);
     g_usb_open_err = (uint32_t) err;

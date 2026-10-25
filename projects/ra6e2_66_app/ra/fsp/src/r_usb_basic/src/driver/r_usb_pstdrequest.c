@@ -598,6 +598,13 @@ static void usb_pstd_get_status1 (usb_utr_t * p_utr)
  * Arguments       : none
  * Return value    : none
  ******************************************************************************/
+/* ⚠ 惰性兜底: 应用层提供的 BOS 描述符(内嵌 MS OS 2.0 平台能力)。
+ * 只有 bcdUSB>=0x0201 时 Windows 才会请求 BOS, 而本项目 USB_BCDNUM 固定为 0x0200,
+ * 故下面 case 0x0F **永不触发**。实测(2026-10-25)升 0x0201 启用 BOS 两次都导致
+ * Windows 把设备标记为 CM_PROB_FAILED_START(比原来的"慢 30s"更糟)。
+ * 详见 usb_cdc_descriptor.c 文件头结论。升级 FSP 前勿擅自启用。 */
+extern uint8_t g_apl_bos_descriptor[];
+
 static void usb_pstd_get_descriptor1 (usb_utr_t * p_utr)
 {
     uint16_t  len;
@@ -835,6 +842,28 @@ static void usb_pstd_get_descriptor1 (usb_utr_t * p_utr)
             {
                 /* Not support */
                 usb_pstd_set_stall_pipe0(p_utr);
+                break;
+            }
+
+            /*---- BOS descriptor (type 0x0F): 含 MS OS 2.0 平台能力 ----
+             * ⚠ 仅当应用层 USB_BCDNUM 升到 0x0201 时 Windows 才会请求; 当前 0x0200 不触发。
+             *   启用后实测会导致设备 CM_PROB_FAILED_START, 见上方 extern 处说明。 */
+            case 0x0FU:
+            {
+                p_table = g_apl_bos_descriptor;
+                len     = (uint16_t) (*(uint8_t *) ((uint32_t) p_table + (uint32_t) 2));
+                len     = (uint16_t) (len << 8);
+                len     = (uint16_t) (len + (uint16_t) (*(uint8_t *) ((uint32_t) p_table + (uint32_t) 3)));
+                if (g_usb_pstd_req_length < len)
+                {
+                    /* Control read start */
+                    usb_pstd_ctrl_read((uint32_t) g_usb_pstd_req_length, p_table, p_utr);
+                }
+                else
+                {
+                    /* Control read start */
+                    usb_pstd_ctrl_read((uint32_t) len, p_table, p_utr);
+                }
                 break;
             }
 
