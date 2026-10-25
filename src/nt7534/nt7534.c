@@ -260,8 +260,18 @@ static void draw_usb_diag(u8g2_t * g)
 /** 两台风扇的相位, 单位 1/100 度。3 叶对称周期 120° = 12000 cd = 24 帧。 */
 static int32_t  s_fan_phase_cd[2] = { 0, 0 };
 
-/** 1 = 本次是风扇动画帧, 只脏刷右下风扇区; 0 = 全屏刷新。 */
-static uint8_t  s_flush_area = 0u;
+/** 1 ms 系统心跳（Cortex-M 内核 SysTick 中断驱动）。
+ *  为什么要自己开:
+ *   - DWT 的 CYCCNT 在本 M33 上**不走**(实测两次读同一个值), 原来那种算法拿不到真实时间;
+ *   - FSP 裸机没有系统时基, USB/串口都不依赖 SysTick, 所以这里自建一个不会打架;
+ *   - 中断优先级保持默认(最低), 不会挤掉 USB 中断。
+ *  用途: 风扇转速按**真实时间**推进(与帧率无关)、主循环按 1 s 定拍、串口轮询按 50 ms。 */
+volatile uint32_t g_ms_tick = 0u;
+
+void SysTick_Handler(void)
+{
+    g_ms_tick++;
+}
 
 /** 按 RPM 推进两台风扇相位: 角速度 = RPM/24 (°/s) ⇒ 每 ms 增加 RPM/240 (1/100°)。 */
 static void fan_advance(uint32_t dt_ms)
@@ -364,6 +374,27 @@ static void draw_small_label(u8g2_t * g, const char * s,
     }
 }
 
+/** 只重画右下角两个风扇格(不动表格线与文字), 供动画帧调用。
+ *  为什么需要它: 之前动画帧直接调 draw_layout_a() —— 那是**整屏重画 + 清缓冲**,
+ *  单次约 16 ms; 1 s 的等待里要跑 125 帧 ⇒ 主循环被拖到 ~2.5 s,
+ *  连带把"数字 1 Hz 更新"压成 2.5 s 一次。现在只清两个格子内部再画,
+ *  单次约 1.5 ms, 主循环回到 ~1 s, 数字真正 1 Hz 刷新。
+ *  ⚠ 清的范围特意避开 y=32 / y=63 横线和 x=54 / x=86 / x=127 竖线。 */
+static void draw_fan_cells(void)
+{
+    u8g2_t * g = U8G2_Port();
+
+    u8g2_SetDrawColor(g, 0);                /* 画刷=0 ⇒ 清像素 */
+    u8g2_DrawBox(g, 55, 33, 31, 30);        /* CPU 格内部 x55..85, y33..62 */
+    u8g2_DrawBox(g, 87, 33, 40, 30);        /* GPU 格内部 x87..126, y33..62 */
+    u8g2_SetDrawColor(g, 1);                /* 恢复画刷=1 ⇒ 置像素 */
+
+    draw_small_label(g, "CPU", 55, 85, 34);
+    draw_fan        (g, 60, 43, s_fan_phase_cd[0]);
+    draw_small_label(g, "GPU", 87, 126, 34);
+    draw_fan        (g, 97, 43, s_fan_phase_cd[1]);
+}
+
 /** 画一帧表格版界面(真实数据, 来自串口/USB CDC 链路)。 */
 static void draw_layout_a(void)
 {
@@ -444,15 +475,9 @@ static void draw_layout_a(void)
     draw_small_label(g, "GPU", 87, 126, 34);
     draw_fan        (g, 97, 43, s_fan_phase_cd[1]);
 
-    if (0u != s_flush_area)
-    {
-        /* 脏区: x54..127 / y32..63 ⇒ tile tx=6(48), tw=10(48..127), ty=4, th=4(页4..7) */
-        U8G2_Port_FlushArea(6u, 4u, 10u, 4u);
-    }
-    else
-    {
-        U8G2_Port_Flush();
-    }
+    /* 数据/状态帧: 全屏刷新(1 Hz 一次, 1024 B ≈ 8 ms, 无感)。
+     * 风扇动画帧不走这里, 见 draw_fan_cells() + U8G2_Port_FlushArea()。 */
+    U8G2_Port_Flush();
 }
 
 #endif /* U8G2_PORT_ENABLE */
@@ -719,9 +744,14 @@ void NT7534_Run(void)
     RTT_Printf("layout A live, col_offset=%u page_rot=%u\n",
                (unsigned) NT7534_COL_OFFSET, (unsigned) NT7534_PAGE_ROT);
 
+    /* 1 ms 心跳(内核 SysTick): 风扇转速/主循环定拍/串口轮询都按真实时间走。 */
+    (void) SysTick_Config(SystemCoreClock / 1000u);
+
     while (1)
     {
-        uint16_t k;
+        uint32_t t_loop;
+        uint32_t t_uart;
+        uint32_t t_anim;
 
         UART_Link_Poll();                /* 先解析已到的字节, 再画 */
 #if (0 != UART_LINK_BEACON)
@@ -756,37 +786,56 @@ void NT7534_Run(void)
                        (unsigned long) g_link_err_xor, (unsigned) UART_Link_Online());
         }
 
-        /* 1 s 的等待拆成 2 ms 细片:
+        /* 1 s 的等待拆成 2 ms 细片, 但**按 SysTick 真实时间定拍**:
          *   - 每片都 USB_CDC_Poll() 排空 USB 事件 —— FSP 的裸机事件缓冲只有 8 深,
          *     原来 1 s 才转一圈, 枚举突发事件必然溢出丢事件(表现为有时卡在 Address 态);
-         *   - 每 50 ms 收一次串口字节 + 累计接收超时(行为与原来 4×250 ms 等价)。 */
-        for (k = 0u; k < 500u; k++)
+         *   - 每 50 ms 收一次串口字节 + 累计接收超时;
+         *   - 每 1000 ms 结束本轮 ⇒ 数据/状态稳定 1 Hz。原来按片计数(k<500 × 2ms),
+         *     但 R_BSP_SoftwareDelay 实测比标称长, 实际一轮 ~1.7 s, 数字就掉到 ~0.6 Hz。 */
+        t_loop = g_ms_tick;
+        t_uart = t_loop;
+        t_anim = t_loop;
+
+        for (;;)
         {
+            uint32_t now;
+
             R_BSP_SoftwareDelay(2u, BSP_DELAY_UNITS_MILLISECONDS);
             USB_CDC_Poll();
-            if (0u == (k % 25u))
+
+            now = g_ms_tick;
+            if ((uint32_t) (now - t_uart) >= 50u)
             {
+                t_uart = now;
                 UART_Link_Poll();
                 UART_Link_Tick(50u);
             }
 #if (0 != U8G2_PORT_ENABLE)
-            /* 风扇动画重绘: 每 11 片(≈22ms)+刷屏≈30fps, 与上位机送数频率解耦。
-             * 节拍用 2ms 切片计数(DWT 在本 M33 上不计, 已弃用)。
-             * 发送层半位延时已降(16→4), 整屏刷新 ~7-8ms, 故可撑到 30fps。
-             * 门控: 有有效 RPM 数值(cf/gf>=0)就转, 无数据(-1)则静止。
-             * 观感偏慢 ⇒ 每帧推进量 ×1.5(≈50ms 对应 1.5 倍速)。 */
-            if (0u == (k % 4u))
+            /* 风扇动画: 按**真实时间**推进, 与上位机送数频率、与帧率都无关。
+             *   - 每 16 ms 一帧(≈60 fps): 只重画右下两格 + 脏刷该区(约 1.5 ms);
+             *   - 相位 = 真实 dt × 1.5(即"角速度 = RPM/24 度/秒 的 1.5 倍");
+             *   - 门控: cf/gf 均为 -1(无数据)时静止, 但风扇照常显示。 */
+            if ((uint32_t) (now - t_anim) >= 16u)
             {
+                uint32_t dt = (uint32_t) (now - t_anim);
                 const uart_link_data_t * pd = UART_Link_Data();
+
+                t_anim = now;
+                if (dt > 100u) { dt = 100u; }        /* 防卡顿后相位大跳 */
+
                 if ((pd->cf >= 0) || (pd->gf >= 0))
                 {
-                    s_flush_area = 1u;          /* 只脏刷风扇区, 不刷全屏 */
-                    fan_advance(24u);           /* ~62fps × 24ms ≈ 1.5 倍速 */
-                    draw_layout_a();
-                    s_flush_area = 0u;
+                    fan_advance(dt + (dt >> 1));     /* 1.5 倍速 */
+                    draw_fan_cells();
+                    /* 脏区: x54..127 / y32..63 ⇒ tile tx=6(48), tw=10(48..127) */
+                    U8G2_Port_FlushArea(6u, 4u, 10u, 4u);
                 }
             }
 #endif
+            if ((uint32_t) (now - t_loop) >= 1000u)
+            {
+                break;                               /* 本轮 1 s 到 */
+            }
         }
     }
 }
