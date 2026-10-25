@@ -1,6 +1,5 @@
 //! 主窗口：左「板子识别 + 连接」，右「发送数据项 + 实时帧 + 统计」。
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,6 +16,9 @@ struct Shared {
     sample: Sample,
     sent: u64,
     errors: u64,
+    /// 要发送的串口：`Some(port)` = 已连接；`None` = 未连接（只采样、不发）。
+    /// UI 点「连接/断开」写它，监控线程跟随它开关串口。
+    want_port: Option<String>,
     last_frame: String,
     started: Option<Instant>,
     link_up: bool,
@@ -86,7 +88,6 @@ pub struct App {
     scan_rx: Option<Receiver<Vec<Board>>>,
     shared: Arc<Mutex<Shared>>,
     mask_shared: Arc<Mutex<Mask>>,
-    stop: Arc<AtomicBool>,
     font_note: String,
     /// 界面缩放（= 字体与控件大小）。1.0 = 100%，持久化到 %LOCALAPPDATA%。
     zoom: f32,
@@ -125,7 +126,6 @@ impl App {
             scan_rx: None,
             shared: Arc::new(Mutex::new(Shared::default())),
             mask_shared: Arc::new(Mutex::new(Mask::default())),
-            stop: Arc::new(AtomicBool::new(false)),
             font_note,
             zoom,
         };
@@ -145,6 +145,16 @@ impl App {
             }
         }
         app.start_scan();
+
+        // 常驻监控线程：**开机即开始采样**（未连接板子也有读数），
+        // 连上板子后同一条线程再负责发帧（见 `monitor()`）。
+        {
+            let shared = app.shared.clone();
+            let mask = app.mask_shared.clone();
+            let log = app.log_tx.clone();
+            std::thread::spawn(move || monitor(shared, mask, log));
+        }
+
         app
     }
 
@@ -203,7 +213,6 @@ impl App {
             return;
         }
 
-        self.stop.store(false, Ordering::Relaxed);
         self.running = true;
         self.push_log(format!(
             "开始连接 {}（ID {}）...",
@@ -211,135 +220,158 @@ impl App {
             b.id.clone().unwrap_or_else(|| "未识别".into())
         ));
 
-        let stop = self.stop.clone();
-        let shared = self.shared.clone();
-        let mask = self.mask_shared.clone();
-        let log = self.log_tx.clone();
-        std::thread::spawn(move || worker(b.port, stop, shared, mask, log));
+        // 只登记"要发到哪个串口"，真正的开关串口由常驻监控线程做
+        if let Ok(mut sh) = self.shared.lock() {
+            sh.want_port = Some(b.port.clone());
+            sh.link_up = false;
+        }
     }
 
     fn stop_connect(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
         self.running = false;
         if let Ok(mut s) = self.shared.lock() {
+            s.want_port = None;          // 监控线程看到 None 就会关串口
             s.link_up = false;
         }
-        self.push_log("已断开".into());
+        self.push_log("已断开（采样继续，只是不再发帧）".into());
     }
 }
 
 // ---------------------------------------------------------------- 工作线程
 
-fn worker(
-    port: String,
-    stop: Arc<AtomicBool>,
-    shared: Arc<Mutex<Shared>>,
-    mask: Arc<Mutex<Mask>>,
-    log: Sender<String>,
-) {
+/// 常驻监控线程：**始终采样**（未连接板子也有读数），并按 `shared.want_port`
+/// 自动开关串口、发帧。这样"打开程序就有数据"，不必先连板子。
+fn monitor(shared: Arc<Mutex<Shared>>, mask: Arc<Mutex<Mask>>, log: Sender<String>) {
     let say = |m: String| {
         let _ = log.send(m);
     };
 
     // LHM 没跑就没有温度/风扇（它要读 MSR/SuperIO 内核驱动）
     match crate::lhm::ensure_running() {
-        Ok(()) => say("LHM 已就绪".into()),
+        Ok(()) => say("LHM 已就绪（未连接板子也会采样）".into()),
         Err(e) => say(format!("LHM 不可用: {e}（温度/风扇会缺失）")),
     }
-
-    // ⚠ 用 acquire/release（句柄槽）而不是 RawSerial::open：
-    //   若这里直接 open 再在函数结束时 drop ⇒ CloseHandle 会拉低 DTR ⇒ 卡 30 s。
-    let mut ser = match board::acquire(&port) {
-        Ok(s) => s,
-        Err(e) => {
-            say(format!("打开串口失败: {e}"));
-            if let Ok(mut sh) = shared.lock() {
-                sh.link_up = false;
-            }
-            return;
-        }
-    };
-    say(format!("串口已打开 {port}（未设置 DTR/RTS）"));
 
     let mut cpu = CpuUsage::new();
     let mut gpu = GpuUsage::new();
     if gpu.is_none() {
-        say("PDH \\GPU Engine 不可用，GPU 使用率将缺失".into());
+        say("PDH 的 GPU Engine 计数器不可用，GPU 使用率将缺失".into());
     }
 
-    if let Ok(mut sh) = shared.lock() {
-        sh.started = Some(Instant::now());
-        sh.sent = 0;
-        sh.errors = 0;
-        sh.link_up = true;
-    }
-
+    // 已打开的串口（port 名 + 句柄）。None = 当前不发送。
+    let mut open: Option<(String, board::RawSerial)> = None;
     let period = Duration::from_millis(1000);
 
-    while !stop.load(Ordering::Relaxed) {
+    loop {
         let tick = Instant::now();
 
+        // 1) 采样（无条件）
         let sample = collector::collect(&mut cpu, &mut gpu);
 
-        let items = mask.lock().map(|m| m.items()).unwrap_or_default();
-        let payload = board::build_payload(&sample, &items);
-
-        if !payload.is_empty() {
-            let f = board::frame(&payload);
-            let mut ok = true;
-            if let Err(e) = ser.write_all(&f) {
-                ok = false;
-                say(format!("写失败: {e}"));
-                // 设备可能刚被重新枚举（拔插 Type-C / 复位 / 重烧固件）：
-                // 句柄指向已消失的设备对象，此时"重开 COM 口"是唯一解。
-                if !ser.alive() {
-                    say("句柄已失效（设备重新枚举过）→ 重新打开串口".into());
-                    match board::acquire(&port) {
-                        // v16 起 CloseHandle 是 2 ms 级，旧句柄正常析构即可
-                        Ok(s2) => ser = s2,
-                        Err(ee) => say(format!("重开串口失败: {ee}")),
-                    }
-                }
+        // 2) 串口状态跟随 want_port
+        let want = shared.lock().ok().and_then(|s| s.want_port.clone());
+        let cur = open.as_ref().map(|(p, _)| p.clone());
+        let mut need_drop = false;
+        if cur != want {
+            if let Some((p, ser)) = open.take() {
+                // 句柄放回槽里复用，**不关闭**（关闭会拉低 DTR ⇒ 主机侧 30 s 才认回）
+                board::release(&p, ser);
+                say(format!("关闭串口 {p}"));
             }
             if let Ok(mut sh) = shared.lock() {
-                if ok {
-                    sh.sent += 1;
-                    sh.last_frame = String::from_utf8_lossy(&f).trim_end().to_string();
-                    if let Some(t0) = sh.started {
-                        let secs = t0.elapsed().as_secs_f32().max(0.001);
-                        sh.rate = sh.sent as f32 / secs;
+                sh.link_up = false;
+            }
+            if let Some(w) = want.clone() {
+                match board::acquire(&w) {
+                    Ok(ser) => {
+                        say(format!("串口已打开 {w}（未设置 DTR/RTS）"));
+                        open = Some((w, ser));
+                        if let Ok(mut sh) = shared.lock() {
+                            sh.started = Some(Instant::now());
+                            sh.sent = 0;
+                            sh.errors = 0;
+                            sh.link_up = true;
+                        }
                     }
-                } else {
-                    sh.errors += 1;
+                    Err(e) => {
+                        say(format!("打开串口失败: {e}（采样继续）"));
+                        if let Ok(mut sh) = shared.lock() {
+                            sh.want_port = None;   // 让 UI 的「连接」按钮回到未连接态
+                        }
+                    }
                 }
             }
         }
 
+        // 3) 有串口就发一帧
+        if let Some((port, ser)) = open.as_mut() {
+            let items = mask.lock().map(|m| m.items()).unwrap_or_default();
+            let payload = board::build_payload(&sample, &items);
+
+            if !payload.is_empty() {
+                let f = board::frame(&payload);
+                let mut ok = true;
+                if let Err(e) = ser.write_all(&f) {
+                    ok = false;
+                    say(format!("写失败: {e}"));
+                    // 设备可能刚被重新枚举（拔插 Type-C / 复位 / 重烧固件）
+                    if !ser.alive() {
+                        say("句柄已失效（设备重新枚举过）→ 重新打开串口".into());
+                        match board::acquire(port) {
+                            Ok(s2) => *ser = s2,
+                            Err(ee) => {
+                                say(format!("重开串口失败: {ee}"));
+                                need_drop = true;
+                            }
+                        }
+                    }
+                }
+                if let Ok(mut sh) = shared.lock() {
+                    if ok {
+                        sh.sent += 1;
+                        sh.last_frame = String::from_utf8_lossy(&f).trim_end().to_string();
+                        if let Some(t0) = sh.started {
+                            let secs = t0.elapsed().as_secs_f32().max(0.001);
+                            sh.rate = sh.sent as f32 / secs;
+                        }
+                    } else {
+                        sh.errors += 1;
+                    }
+                }
+            }
+        }
+        if need_drop {
+            if let Some((p, ser)) = open.take() {
+                board::release(&p, ser);
+            }
+            if let Ok(mut sh) = shared.lock() {
+                sh.want_port = None;
+                sh.link_up = false;
+            }
+        }
+
+        // 4) 把读数交给界面（未连接也更新，这就是"打开就有读数"）
         if let Ok(mut sh) = shared.lock() {
             sh.sample = sample;
         }
 
+        // 5) 睡到下一个整秒（切片睡，断开能及时响应）
         let spent = tick.elapsed();
         if spent < period {
-            // 切成小片睡，断开能及时响应
-            let mut left = period - spent;
-            while left > Duration::ZERO && !stop.load(Ordering::Relaxed) {
-                let step = left.min(Duration::from_millis(100));
-                std::thread::sleep(step);
-                left -= step;
+            let left = period - spent;
+            let mut slept = Duration::ZERO;
+            while slept < left {
+                std::thread::sleep((left - slept).min(Duration::from_millis(100)));
+                slept = tick.elapsed();
             }
         }
     }
-
-    if let Ok(mut sh) = shared.lock() {
-        sh.link_up = false;
-    }
-    // 句柄放回槽里复用，**不关闭**（关闭 = 30 s）。
-    board::release(&port, ser);
-    say("发送线程已退出".into());
 }
 
 // ---------------------------------------------------------------- 字体
+
+/// 读数高亮色：亮绿（深色主题下对比强，一眼能看到数值在跳）。
+const READOUT_GREEN: egui::Color32 = egui::Color32::from_rgb(0x3D, 0xFF, 0x7A);
 
 /// egui 自带字体没有中文。Windows 上直接读系统字体（不随包分发，避免字体授权问题）。
 /// 装载字体：**优先用粗体字面**，这样整个界面天然是粗的。
@@ -493,10 +525,20 @@ impl eframe::App for App {
             }
         }
 
-        let (sample, sent, errors, last_frame, link_up, rate) = {
+        let (sample, sent, errors, last_frame, link_up, rate, want_port) = {
             let s = self.shared.lock().unwrap();
-            (s.sample.clone(), s.sent, s.errors, s.last_frame.clone(), s.link_up, s.rate)
+            (
+                s.sample.clone(), s.sent, s.errors,
+                s.last_frame.clone(), s.link_up, s.rate, s.want_port.clone(),
+            )
         };
+
+        // 监控线程打开串口失败时会把 want_port 清空 —— 这里把界面状态同步回去，
+        // 免得一直卡在「连接中...」。
+        if self.running && !link_up && want_port.is_none() {
+            self.running = false;
+            self.push_log("串口未能打开，已回到未连接状态（采样继续）".into());
+        }
 
         self.top_bar(ui, link_up, rate);
 
@@ -738,13 +780,13 @@ impl App {
             bottom_row(ui, |ui| {
                 ui.add_enabled_ui(self.mask.cpu_group, |ui| {
                     ui.checkbox(&mut self.mask.cpu_temp, "温度");
-                    ui.label(egui::RichText::new(fmt(sample.ct, "°C")).size(11.0).monospace().weak());
+                    ui.label(egui::RichText::new(fmt(sample.ct, "°C")).size(11.0).monospace().color(READOUT_GREEN));
                     ui.add_space(10.0);
                     ui.checkbox(&mut self.mask.cpu_load, "占用");
-                    ui.label(egui::RichText::new(fmt(sample.cu, "%")).size(11.0).monospace().weak());
+                    ui.label(egui::RichText::new(fmt(sample.cu, "%")).size(11.0).monospace().color(READOUT_GREEN));
                     ui.add_space(10.0);
                     ui.checkbox(&mut self.mask.cpu_fan, "风扇");
-                    ui.label(egui::RichText::new(fmt(sample.cf_display, sample.cf_unit.suffix())).size(11.0).monospace().weak());
+                    ui.label(egui::RichText::new(fmt(sample.cf_display, sample.cf_unit.suffix())).size(11.0).monospace().color(READOUT_GREEN));
                 });
             });
         });
@@ -757,16 +799,16 @@ impl App {
             bottom_row(ui, |ui| {
                 ui.add_enabled_ui(self.mask.gpu_group, |ui| {
                     ui.checkbox(&mut self.mask.gpu_temp, "温度");
-                    ui.label(egui::RichText::new(fmt(sample.gt, "°C")).size(11.0).monospace().weak());
+                    ui.label(egui::RichText::new(fmt(sample.gt, "°C")).size(11.0).monospace().color(READOUT_GREEN));
                     ui.add_space(10.0);
                     ui.checkbox(&mut self.mask.gpu_load, "占用");
-                    ui.label(egui::RichText::new(fmt(sample.gu, "%")).size(11.0).monospace().weak());
+                    ui.label(egui::RichText::new(fmt(sample.gu, "%")).size(11.0).monospace().color(READOUT_GREEN));
                     ui.add_space(10.0);
                     ui.checkbox(&mut self.mask.gpu_fan, "风扇");
-                    ui.label(egui::RichText::new(fmt(sample.gf_display, sample.gf_unit.suffix())).size(11.0).monospace().weak());
+                    ui.label(egui::RichText::new(fmt(sample.gf_display, sample.gf_unit.suffix())).size(11.0).monospace().color(READOUT_GREEN));
                     ui.add_space(10.0);
                     ui.checkbox(&mut self.mask.gpu_vram, "显存");
-                    ui.label(egui::RichText::new(fmt(sample.gv, "%")).size(11.0).monospace().weak());
+                    ui.label(egui::RichText::new(fmt(sample.gv, "%")).size(11.0).monospace().color(READOUT_GREEN));
                 });
             });
         });
@@ -777,7 +819,7 @@ impl App {
             bottom_row(ui, |ui| {
                 ui.checkbox(&mut self.mask.mem, egui::RichText::new("内存").size(12.0).strong());
                 // 间距由 item_spacing.x 提供，别再叠加 add_space（会变成 16px）
-                ui.label(egui::RichText::new(fmt(sample.mu, "%")).size(11.0).monospace().weak());
+                ui.label(egui::RichText::new(fmt(sample.mu, "%")).size(11.0).monospace().color(READOUT_GREEN));
             });
         });
 
