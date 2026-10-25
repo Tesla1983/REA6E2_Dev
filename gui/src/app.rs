@@ -180,17 +180,45 @@ impl App {
         }
     }
 
-    /// 当前界面偏好（缩放 + 窗口内尺寸）。
-    fn current_settings(ctx: &egui::Context) -> Settings {
-        let window = ctx
-            .input(|i| i.viewport().inner_rect)
-            .map(|r| (r.width(), r.height()));
-        Settings { zoom: ctx.zoom_factor(), window }
+    /// 当前界面偏好（缩放 + 窗口尺寸/位置）。
+    ///
+    /// 最大化/全屏/最小化时**不改几何**（沿用 `prev`）：否则会把"最大化后的尺寸"当成
+    /// 普通窗口尺寸存下来，下次启动就变成一个占满屏、不能还原的怪窗口。
+    fn current_settings(ctx: &egui::Context, prev: &Settings) -> Settings {
+        let mut st = Settings {
+            zoom: ctx.zoom_factor(),
+            window: prev.window,
+            pos: prev.pos,
+        };
+        if let Some((pos, size)) = Self::observed_geometry(ctx) {
+            st.pos = Some(pos);
+            st.window = Some(size);
+        }
+        st
+    }
+
+    /// 观测到的 (外框左上角, 内尺寸)，单位都是**点**。最大化/全屏/最小化时返回 None。
+    fn observed_geometry(ctx: &egui::Context) -> Option<((f32, f32), (f32, f32))> {
+        ctx.input(|i| {
+            let v = i.viewport();
+            if v.maximized.unwrap_or(false)
+                || v.fullscreen.unwrap_or(false)
+                || v.minimized.unwrap_or(false)
+            {
+                return None;
+            }
+            match (v.outer_rect, v.inner_rect) {
+                (Some(o), Some(inn)) => {
+                    Some(((o.min.x, o.min.y), (inn.width(), inn.height())))
+                }
+                _ => None,
+            }
+        })
     }
 
     /// 立刻落盘（缩放菜单点选、关窗时用）。
     fn save_settings_now(&mut self, ctx: &egui::Context) {
-        let st = Self::current_settings(ctx);
+        let st = Self::current_settings(ctx, &self.pending);
         st.save();
         self.saved = st;
         self.pending = st;
@@ -200,7 +228,7 @@ impl App {
     /// 每帧调用：值**稳定 600 ms** 后自动落盘。
     /// 拖动窗口 / Ctrl+滚轮时每秒会变几十次，不去抖就会疯狂写文件。
     fn autosave_settings(&mut self, ctx: &egui::Context) {
-        let cur = Self::current_settings(ctx);
+        let cur = Self::current_settings(ctx, &self.pending);
         self.zoom = cur.zoom;              // 让"当前 xx%"跟随 Ctrl+滚轮
 
         if cur != self.pending {
@@ -517,6 +545,25 @@ fn build_visuals() -> egui::Visuals {
 }
 
 /// 界面设置的落盘位置：`%LOCALAPPDATA%\Ra6e2Monitor\ui.json`
+/// 虚拟桌面范围（物理像素，含所有显示器）：(x, y, w, h)。
+/// 用来判断"上次存的窗口位置是否还落在显示器上"（副屏拔掉、分辨率变小都会踩）。
+fn virtual_screen_px() -> Option<(f32, f32, f32, f32)> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+    unsafe {
+        let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        Some((x as f32, y as f32, w as f32, h as f32))
+    }
+}
+
 fn settings_path() -> std::path::PathBuf {
     // 便携模式：**exe 同目录若已存在 ui.json，就优先用它**（设置随程序目录走，
     // 拷给别人时连版面/缩放一起带过去）。只认"已存在"，避免往 Program Files
@@ -542,12 +589,15 @@ fn settings_path() -> std::path::PathBuf {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
     pub zoom: f32,
+    /// 窗口内尺寸（点）。不记这个，重开就回到默认大小。
     pub window: Option<(f32, f32)>,
+    /// 窗口外框左上角（点，虚拟桌面坐标）。不记这个，重开就回到系统默认位置。
+    pub pos: Option<(f32, f32)>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { zoom: 1.0, window: None }
+        Self { zoom: 1.0, window: None, pos: None }
     }
 }
 
@@ -564,6 +614,16 @@ impl Settings {
         if let Some(z) = v.get("zoom").and_then(|x| x.as_f64()) {
             if (0.6..=2.5).contains(&z) {
                 out.zoom = z as f32;
+            }
+        }
+        if let Some(arr) = v.get("pos").and_then(|x| x.as_array()) {
+            if arr.len() == 2 {
+                if let (Some(x), Some(y)) = (arr[0].as_f64(), arr[1].as_f64()) {
+                    // 离谱值（比如上次接的副屏已经不在了）在首帧会被挪回主屏，这里先收下
+                    if x.abs() <= 20000.0 && y.abs() <= 20000.0 {
+                        out.pos = Some((x as f32, y as f32));
+                    }
+                }
             }
         }
         if let Some(arr) = v.get("window").and_then(|x| x.as_array()) {
@@ -584,13 +644,14 @@ impl Settings {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let text = match self.window {
-            Some((w, h)) => format!(
-                "{{\"zoom\":{},\"window\":[{:.0},{:.0}]}}",
-                self.zoom, w, h
-            ),
-            None => format!("{{\"zoom\":{}}}", self.zoom),
-        };
+        let mut text = format!("{{\"zoom\":{}", self.zoom);
+        if let Some((w, h)) = self.window {
+            text.push_str(&format!(",\"window\":[{:.0},{:.0}]", w, h));
+        }
+        if let Some((x, y)) = self.pos {
+            text.push_str(&format!(",\"pos\":[{:.0},{:.0}]", x, y));
+        }
+        text.push('}');
         // 原子写：先写临时文件再替换。直接 fs::write 半路断电会留下被截断的 JSON
         // （读的时候虽然有兜底，但那等于把用户设置丢了）。
         let tmp = p.with_extension("json.tmp");
@@ -631,7 +692,7 @@ impl eframe::App for App {
                 // 窗口别超过显示器 90%
                 let max_w = (m.x * 0.90).max(840.0);
                 let max_h = (m.y * 0.90).max(540.0);
-                if let Some((w, h)) = Self::current_settings(&ctx).window {
+                if let Some((w, h)) = Self::current_settings(&ctx, &self.pending).window {
                     if w > max_w || h > max_h {
                         let nw = w.min(max_w);
                         let nh = h.min(max_h);
@@ -654,6 +715,32 @@ impl eframe::App for App {
                         z * 100.0,
                         max_zoom * 100.0
                     ));
+                }
+
+                // 位置：上次可能是在副屏 / 大屏上关的，现在副屏拔了、或分辨率变小了，
+                // 窗口就会跑到看不见的地方。这时挪回主屏左上角附近。
+                if let Some((vx, vy, vw, vh)) = virtual_screen_px() {
+                    if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                        let ppp = ctx.pixels_per_point();
+                        let wl = rect.min.x * ppp;
+                        let wt = rect.min.y * ppp;
+                        let wr = rect.max.x * ppp;
+                        let wb = rect.max.y * ppp;
+                        // 与虚拟桌面的交集（物理像素）
+                        let ix = (wr.min(vx + vw) - wl.max(vx)).max(0.0);
+                        let iy = (wb.min(vy + vh) - wt.max(vy)).max(0.0);
+                        if ix < 100.0 || iy < 60.0 {
+                            let nx = (vx + 40.0) / ppp;
+                            let ny = (vy + 40.0) / ppp;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                                egui::pos2(nx, ny),
+                            ));
+                            self.push_log(format!(
+                                "上次的窗口位置已不在任何显示器上（可见 {:.0}×{:.0}），已挪回主屏",
+                                ix, iy
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -1066,7 +1153,11 @@ mod settings_tests {
         // SAFETY: 本用例独占 LOCALAPPDATA（其它用例不读它）；这里只在测试进程里改环境变量。
         unsafe { std::env::set_var("LOCALAPPDATA", &tmp) };
 
-        let want = Settings { zoom: 1.25, window: Some((1280.0, 720.0)) };
+        let want = Settings {
+            zoom: 1.25,
+            window: Some((1280.0, 720.0)),
+            pos: Some((240.0, 120.0)),
+        };
         want.save();
         assert_eq!(Settings::load(), want, "写进去的缩放/窗口大小要能原样读回");
 
@@ -1075,6 +1166,11 @@ mod settings_tests {
         let bad = Settings::load();
         assert_eq!(bad.zoom, 1.0, "0.6..=2.5 之外的缩放要拒绝");
         assert_eq!(bad.window, None, "过小的窗口尺寸要拒绝");
+        assert_eq!(bad.pos, None, "没写 pos 字段 = 不指定位置");
+
+        // 离谱坐标（比如 20001）要被拒绝，避免窗口跑到看不见的地方
+        std::fs::write(settings_path(), r#"{"zoom":1.0,"pos":[99999,0]}"#).unwrap();
+        assert_eq!(Settings::load().pos, None, "离谱坐标要拒绝");
 
         // 损坏的 JSON 不能 panic
         std::fs::write(settings_path(), "not json").unwrap();
