@@ -14,13 +14,13 @@ Think of it as a small hardware dashboard for your desk that mirrors your PC's l
 ## Architecture
 
 ```
-┌─────────────────────────┐        USB CDC (virtual serial)       ┌──────────────────────────┐
-│     Windows PC          │ ───────────────────────────────────▶ │   RA6E2 board            │
-│  ra6e2-monitor          │                                       │   bare-metal FW (FSP 6.6)│
-│  (Rust + egui)          │                                       │   NT7534 128×64 render   │
-│  collect CPU/GPU/mem    │                                       │                          │
-└─────────────────────────┘                                       └──────────────────────────┘
-       PDH / DXGI / LHM                                               (Cortex-M33 @ 200MHz)
+┌────────────────────────┐                        ┌────────────────────────┐
+│       Windows PC       │                        │      RA6E2 board       │
+│     ra6e2-monitor      │USB CDC (virtual serial)│   bare-metal FW 6.6.0  │
+│      (Rust + egui)     │─────────────────────-->│    NT7534 128x64       │
+│   collect CPU/GPU/mem  │                        │                        │
+└────────────────────────┘                        └────────────────────────┘
+       PDH / DXGI / LHM                           (Cortex-M33 @ 200MHz)
 ```
 
 The host app does the "collect + send"; the board does the "receive + render". The two are
@@ -159,5 +159,4 @@ cargo build --release             # output: gui/target/release/ra6e2-monitor.exe
 
 ## License
 
-This project currently ships **without a LICENSE file**. Add an appropriate license before
-publishing.
+This project is distributed under the **MIT License** — see the `LICENSE` file at the repo root.
