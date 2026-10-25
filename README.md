@@ -140,7 +140,7 @@ cargo build --release             # 产物: gui/target/release/ra6e2-monitor.exe
 | `src/` | 固件源码（NT7534 屏驱动、USB CDC、数据链路解析） |
 | `gui/` | 上位机（Rust + egui） |
 | `scripts/` | 构建 / 烧录脚本 |
-| `docs/` | 开发环境、屏、USB CDC 等相关文档（含 `3.5寸屏开发文档.md`） |
+| `docs/立创地奇星RA6E2/` | 立创地奇星 RA6E2 官方数据手册 `datasheet.pdf`（体积最小版） |
 | `vendor/`, `third_party/` | FSP 与第三方组件 |
 | `host/`, `tools/` | 辅助脚本与工具 |
 

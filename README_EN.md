@@ -151,7 +151,7 @@ cargo build --release             # output: gui/target/release/ra6e2-monitor.exe
 | `src/` | Firmware source (NT7534 driver, USB CDC, data-link parser) |
 | `gui/` | Host application (Rust + egui) |
 | `scripts/` | Build / flash scripts |
-| `docs/` | Dev-environment, display, USB CDC docs (incl. `3.5寸屏开发文档.md`) |
+| `docs/立创地奇星RA6E2/` | LCKFB Dikixing RA6E2 official datasheet `datasheet.pdf` (smallest-volume edition) |
 | `vendor/`, `third_party/` | FSP and third-party components |
 | `host/`, `tools/` | Helper scripts and tools |
 
