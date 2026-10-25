@@ -19,6 +19,10 @@ u8g2_t * U8G2_Port(void);
 /** 把缓冲送到屏（= 重申几何 + u8g2_SendBuffer）。 */
 void U8G2_Port_Flush(void);
 
+/** 脏区刷新: 只把 (tx,ty) 起、tw×th 个 tile(每 tile 8px) 的区域送到屏。
+ *  u8g2 tile 坐标: tx/ty 是 tile 索引, tw/th 是 tile 数。用于风扇动画只刷风扇格。 */
+void U8G2_Port_FlushArea(uint8_t tx, uint8_t ty, uint8_t tw, uint8_t th);
+
 /** 已刷新帧数（探针可读, 在涨 = 界面在实时刷新）。 */
 extern volatile uint32_t g_u8g2_frames;
 

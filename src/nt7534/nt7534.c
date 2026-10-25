@@ -260,6 +260,9 @@ static void draw_usb_diag(u8g2_t * g)
 /** 两台风扇的相位, 单位 1/100 度。3 叶对称周期 120° = 12000 cd = 24 帧。 */
 static int32_t  s_fan_phase_cd[2] = { 0, 0 };
 
+/** 1 = 本次是风扇动画帧, 只脏刷右下风扇区; 0 = 全屏刷新。 */
+static uint8_t  s_flush_area = 0u;
+
 /** 按 RPM 推进两台风扇相位: 角速度 = RPM/24 (°/s) ⇒ 每 ms 增加 RPM/240 (1/100°)。 */
 static void fan_advance(uint32_t dt_ms)
 {
@@ -440,7 +443,15 @@ static void draw_layout_a(void)
     draw_small_label(g, "GPU", 87, 118, 34);
     draw_fan        (g, 93, 43, s_fan_phase_cd[1]);
 
-    U8G2_Port_Flush();
+    if (0u != s_flush_area)
+    {
+        /* 脏区: x54..119 / y32..63 ⇒ tile tx=6(48), tw=9, ty=4, th=4(页4..7) */
+        U8G2_Port_FlushArea(6u, 4u, 9u, 4u);
+    }
+    else
+    {
+        U8G2_Port_Flush();
+    }
 }
 
 #endif /* U8G2_PORT_ENABLE */
@@ -763,13 +774,15 @@ void NT7534_Run(void)
              * 发送层半位延时已降(16→4), 整屏刷新 ~7-8ms, 故可撑到 30fps。
              * 门控: 有有效 RPM 数值(cf/gf>=0)就转, 无数据(-1)则静止。
              * 观感偏慢 ⇒ 每帧推进量 ×1.5(≈50ms 对应 1.5 倍速)。 */
-            if (0u == (k % 11u))
+            if (0u == (k % 4u))
             {
                 const uart_link_data_t * pd = UART_Link_Data();
                 if ((pd->cf >= 0) || (pd->gf >= 0))
                 {
-                    fan_advance(50u);
+                    s_flush_area = 1u;          /* 只脏刷风扇区, 不刷全屏 */
+                    fan_advance(24u);           /* ~62fps × 24ms ≈ 1.5 倍速 */
                     draw_layout_a();
+                    s_flush_area = 0u;
                 }
             }
 #endif

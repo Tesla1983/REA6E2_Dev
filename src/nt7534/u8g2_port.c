@@ -186,3 +186,10 @@ void U8G2_Port_Flush(void)
     u8g2_SendBuffer(&s_u8g2);
     g_u8g2_frames++;
 }
+
+void U8G2_Port_FlushArea(uint8_t tx, uint8_t ty, uint8_t tw, uint8_t th)
+{
+    /* 只发送指定 tile 区域: 风扇动画每帧只刷右下两格(约 288B vs 全屏 1024B)。 */
+    u8g2_UpdateDisplayArea(&s_u8g2, tx, ty, tw, th);
+    g_u8g2_frames++;
+}
