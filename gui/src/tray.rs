@@ -15,7 +15,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, OnceLock};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
@@ -23,7 +23,8 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, EnumWindows, GetCursorPos, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, GetMessageW, IsWindowVisible, LoadImageW, PostMessageW,
+    GetWindowRect, GetWindowThreadProcessId, GetMessageW, IsWindowVisible, LoadImageW,
+    PostMessageW, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
     PostQuitMessage, RegisterClassW, SetForegroundWindow, ShowWindow, TrackPopupMenu,
     TranslateMessage, HMENU, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MF_SEPARATOR, MF_STRING,
     MSG, SW_RESTORE, SW_SHOW, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE,
@@ -254,6 +255,28 @@ fn show_main_window() {
     }
 }
 
+/// 主窗口**外框**矩形（**物理像素**）：(left, top, right, bottom)。
+///
+/// ⚠ 为什么不用 egui 的 `viewport().outer_rect`：那是"**缩放后的点**"
+/// （`pixels_per_point` = 原生缩放 × ui 缩放因子），而 `ViewportBuilder::with_position` /
+/// `with_inner_size` 是按**原生缩放**解释的 ⇒ zoom=1.5 时会多除一次 1.5，
+/// 存下来的位置/尺寸再还原就一定错位（2026-10-25 实测踩到：窗口变小、位置偏移）。
+/// 直接读 Win32 物理像素，和 zoom / DPI 都无关。
+pub fn main_window_rect() -> Option<(i32, i32, i32, i32)> {
+    let hwnd = find_main_window()?;
+    let mut r = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut r) }.ok()?;
+    Some((r.left, r.top, r.right, r.bottom))
+}
+
+/// 用物理像素直接摆放主窗口（不动 Z 序、不抢焦点）。返回是否成功。
+pub fn place_main_window(x: i32, y: i32, w: i32, h: i32) -> bool {
+    let Some(hwnd) = find_main_window() else {
+        return false;
+    };
+    unsafe { SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE) }.is_ok()
+}
+
 unsafe fn build_menu() -> HMENU {
     unsafe {
         let menu = CreatePopupMenu().unwrap_or_default();
@@ -345,6 +368,47 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    unsafe extern "system" fn test_wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        unsafe { DefWindowProcW(h, m, w, l) }
+    }
+
+    /// 窗口几何往返：SetWindowPos(物理像素) 后 GetWindowRect 必须读回同一组数。
+    /// 这是"记住窗口位置/大小"的底层保证（egui 的点要经过 DPI/zoom 换算，不可靠）。
+    #[test]
+    #[ignore]
+    fn window_geometry_roundtrip() {
+        // 造一个标题含 "RA6E2" 的隐藏窗口，让 find_main_window 能找到
+        let hwnd = unsafe {
+            let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap();
+            let class = wide("Ra6e2GeomTestWnd");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(test_wndproc),
+                hInstance: hinst.into(),
+                lpszClassName: PCWSTR(class.as_ptr()),
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(class.as_ptr()),
+                PCWSTR(wide("RA6E2 geometry test").as_ptr()),
+                WINDOW_STYLE(0),
+                0, 0, 400, 300,
+                None, None, Some(hinst.into()), None,
+            )
+            .expect("建测试窗口")
+        };
+
+        assert!(place_main_window(300, 200, 800, 600), "SetWindowPos 应成功");
+        let r = main_window_rect().expect("GetWindowRect 应成功");
+        println!("rect = {r:?}");
+        assert_eq!(r, (300, 200, 1100, 800), "物理像素往返必须一致");
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
 
     /// 冒烟：真的往任务栏塞一次图标再删掉。
     /// 默认 `#[ignore]`（会在通知区闪一下）；验证 Win32 代码路径时手动跑：

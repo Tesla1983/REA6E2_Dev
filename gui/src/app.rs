@@ -100,6 +100,8 @@ pub struct App {
     last_change: Option<Instant>,
     /// 是否已经按本机屏幕做过一次"夹取"（只做一次，别跟用户手动拖动打架）
     screen_checked: bool,
+    /// 上次的窗口位置/尺寸是否已经摆放成功（失败则第一帧再试一次）
+    rect_applied: bool,
     /// 托盘图标（Windows）。None = 创建失败（Explorer 没跑 / 被安全软件拦），
     /// 此时关窗就正常退出。
     tray: Option<crate::tray::Tray>,
@@ -157,6 +159,7 @@ impl App {
             pending: saved,
             last_change: None,
             screen_checked: false,
+            rect_applied: false,
             tray,
             tray_rx,
             _tray_quit: tray_quit,
@@ -177,6 +180,37 @@ impl App {
                 ));
             }
         }
+        // ---- 恢复上次的窗口位置/尺寸 ----
+        // 全程用**物理像素**（Win32 GetWindowRect / SetWindowPos），
+        // 不经过 egui 的"缩放后的点"，否则 zoom≠100% 时位置和尺寸都会错。
+        if let Some((l, t, r, b)) = saved.rect {
+            let (mut w, mut h) = (r - l, b - t);
+            let (mut x, mut y) = (l, t);
+
+            // 夹到本机虚拟桌面内（副屏拔掉 / 分辨率变小 / 用了别人的配置）
+            if let Some((vx, vy, vw, vh)) = virtual_screen_px() {
+                let max_w = (vw * 0.98) as i32;
+                let max_h = (vh * 0.98) as i32;
+                w = w.min(max_w);
+                h = h.min(max_h);
+                let ix = ((x + w) as f32).min(vx + vw) - (x as f32).max(vx);
+                let iy = ((y + h) as f32).min(vy + vh) - (y as f32).max(vy);
+                if ix < 120.0 || iy < 80.0 {
+                    x = vx as i32 + 40;
+                    y = vy as i32 + 40;
+                }
+            }
+
+            if crate::tray::place_main_window(x, y, w, h) {
+                app.saved.rect = Some((x, y, x + w, y + h));
+                app.pending = app.saved;
+                app.rect_applied = true;
+                app.push_log(format!("已恢复窗口位置/尺寸: {w}×{h} @ ({x}, {y})"));
+            } else {
+                app.push_log("恢复窗口位置失败（还没找到主窗口），第一帧再试".into());
+            }
+        }
+
         app.start_scan();
 
         // 常驻监控线程：**开机即开始采样**（未连接板子也有读数），
@@ -206,33 +240,28 @@ impl App {
     fn current_settings(ctx: &egui::Context, prev: &Settings) -> Settings {
         let mut st = Settings {
             zoom: ctx.zoom_factor(),
-            window: prev.window,
-            pos: prev.pos,
+            rect: prev.rect,
         };
-        if let Some((pos, size)) = Self::observed_geometry(ctx) {
-            st.pos = Some(pos);
-            st.window = Some(size);
+        if let Some(r) = Self::observed_rect(ctx) {
+            st.rect = Some(r);
         }
         st
     }
 
-    /// 观测到的 (外框左上角, 内尺寸)，单位都是**点**。最大化/全屏/最小化时返回 None。
-    fn observed_geometry(ctx: &egui::Context) -> Option<((f32, f32), (f32, f32))> {
-        ctx.input(|i| {
+    /// 观测主窗口外框（**物理像素**，Win32 `GetWindowRect`）。
+    /// 最大化/全屏/最小化时返回 None，沿用上次的值 —— 否则会把"最大化后的尺寸"
+    /// 当成普通窗口尺寸存下来，下次开出一个占满屏又还原不了的窗口。
+    fn observed_rect(ctx: &egui::Context) -> Option<(i32, i32, i32, i32)> {
+        let skip = ctx.input(|i| {
             let v = i.viewport();
-            if v.maximized.unwrap_or(false)
+            v.maximized.unwrap_or(false)
                 || v.fullscreen.unwrap_or(false)
                 || v.minimized.unwrap_or(false)
-            {
-                return None;
-            }
-            match (v.outer_rect, v.inner_rect) {
-                (Some(o), Some(inn)) => {
-                    Some(((o.min.x, o.min.y), (inn.width(), inn.height())))
-                }
-                _ => None,
-            }
-        })
+        });
+        if skip {
+            return None;
+        }
+        crate::tray::main_window_rect()
     }
 
     /// 立刻落盘（缩放菜单点选、关窗时用）。
@@ -608,15 +637,16 @@ fn settings_path() -> std::path::PathBuf {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
     pub zoom: f32,
-    /// 窗口内尺寸（点）。不记这个，重开就回到默认大小。
-    pub window: Option<(f32, f32)>,
-    /// 窗口外框左上角（点，虚拟桌面坐标）。不记这个，重开就回到系统默认位置。
-    pub pos: Option<(f32, f32)>,
+    /// 主窗口**外框**矩形，**物理像素** `(left, top, right, bottom)`。
+    ///
+    /// ⚠ 必须是物理像素（Win32 `GetWindowRect`）：egui 的 rects 是"缩放后的点"，
+    /// 用它存再还原会被 zoom 多除一次，窗口位置/大小必错（2026-10-25 实测）。
+    pub rect: Option<(i32, i32, i32, i32)>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { zoom: 1.0, window: None, pos: None }
+        Self { zoom: 1.0, rect: None }
     }
 }
 
@@ -635,23 +665,19 @@ impl Settings {
                 out.zoom = z as f32;
             }
         }
-        if let Some(arr) = v.get("pos").and_then(|x| x.as_array()) {
-            if arr.len() == 2 {
-                if let (Some(x), Some(y)) = (arr[0].as_f64(), arr[1].as_f64()) {
-                    // 离谱值（比如上次接的副屏已经不在了）在首帧会被挪回主屏，这里先收下
-                    if x.abs() <= 20000.0 && y.abs() <= 20000.0 {
-                        out.pos = Some((x as f32, y as f32));
-                    }
-                }
-            }
-        }
-        if let Some(arr) = v.get("window").and_then(|x| x.as_array()) {
-            if arr.len() == 2 {
-                let w = arr[0].as_f64().unwrap_or(0.0);
-                let h = arr[1].as_f64().unwrap_or(0.0);
-                // 太小（还没布局完就存了）不认；过大夹一下
-                if w >= 640.0 && h >= 400.0 {
-                    out.window = Some((w.min(8000.0) as f32, h.min(8000.0) as f32));
+        if let Some(arr) = v.get("rect").and_then(|x| x.as_array()) {
+            if arr.len() == 4 {
+                let n: Vec<i64> = arr.iter().map(|x| x.as_i64().unwrap_or(0)).collect();
+                let (l, t, r, b) = (n[0], n[1], n[2], n[3]);
+                let w = r - l;
+                let h = b - t;
+                // 尺寸太离谱（负的/占满整个虚拟桌面之外的）直接不认；坐标也给个上限
+                if (400..=20000).contains(&w)
+                    && (300..=20000).contains(&h)
+                    && l.abs() <= 20000
+                    && t.abs() <= 20000
+                {
+                    out.rect = Some((l as i32, t as i32, r as i32, b as i32));
                 }
             }
         }
@@ -664,11 +690,8 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let mut text = format!("{{\"zoom\":{}", self.zoom);
-        if let Some((w, h)) = self.window {
-            text.push_str(&format!(",\"window\":[{:.0},{:.0}]", w, h));
-        }
-        if let Some((x, y)) = self.pos {
-            text.push_str(&format!(",\"pos\":[{:.0},{:.0}]", x, y));
+        if let Some((l, t, r, b)) = self.rect {
+            text.push_str(&format!(",\"rect\":[{l},{t},{r},{b}]"));
         }
         text.push('}');
         // 原子写：先写临时文件再替换。直接 fs::write 半路断电会留下被截断的 JSON
@@ -728,29 +751,24 @@ impl eframe::App for App {
         //   · 收进托盘  ⇒ 只有顶栏「收进托盘」按钮 / 托盘菜单的「显示主窗口」才走隐藏。
         // 退出前 on_exit 会保存配置并删掉托盘图标。
 
-        // ---- 换机/换人使用时的一次性自适应 ----
-        // 配置是**按 Windows 账号 + 本机**存的（%LOCALAPPDATA%），换台机器/换个用户
-        // 会用自己的默认值，这没问题；但"别处存下的大尺寸/大缩放"如果被带过来，
-        // 在小屏上会开出屏外或把界面裁掉。这里按本机显示器夹一次（只做一次）。
+        // 恢复窗口几何：App::new 时窗口可能还没建好，这里再试一次
+        if !self.rect_applied {
+            self.rect_applied = true;
+            if let Some((l, t, r, b)) = self.saved.rect {
+                if crate::tray::place_main_window(l, t, r - l, b - t) {
+                    self.push_log("已恢复窗口位置/尺寸（首帧补做）".into());
+                }
+            }
+        }
+
+        // ---- 缩放按本机屏幕夹一次（只做一次）----
+        // 窗口位置/大小是物理像素，已在 App::new() 里摆好，不在这里处理。
         if !self.screen_checked {
             if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
                 self.screen_checked = true;
 
-                // 窗口别超过显示器 90%
                 let max_w = (m.x * 0.90).max(840.0);
                 let max_h = (m.y * 0.90).max(540.0);
-                if let Some((w, h)) = Self::current_settings(&ctx, &self.pending).window {
-                    if w > max_w || h > max_h {
-                        let nw = w.min(max_w);
-                        let nh = h.min(max_h);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(nw, nh)));
-                        self.push_log(format!(
-                            "本机屏幕 {:.0}×{:.0}，窗口已从 {:.0}×{:.0} 夹到 {:.0}×{:.0}",
-                            m.x, m.y, w, h, nw, nh
-                        ));
-                    }
-                }
-
                 // 缩放别大到连"最小窗口"(840×540) 都放不下，否则左右面板会被裁
                 let max_zoom = (max_w / 840.0).min(max_h / 540.0).clamp(0.6, 2.5);
                 let z = ctx.zoom_factor();
@@ -762,32 +780,6 @@ impl eframe::App for App {
                         z * 100.0,
                         max_zoom * 100.0
                     ));
-                }
-
-                // 位置：上次可能是在副屏 / 大屏上关的，现在副屏拔了、或分辨率变小了，
-                // 窗口就会跑到看不见的地方。这时挪回主屏左上角附近。
-                if let Some((vx, vy, vw, vh)) = virtual_screen_px() {
-                    if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
-                        let ppp = ctx.pixels_per_point();
-                        let wl = rect.min.x * ppp;
-                        let wt = rect.min.y * ppp;
-                        let wr = rect.max.x * ppp;
-                        let wb = rect.max.y * ppp;
-                        // 与虚拟桌面的交集（物理像素）
-                        let ix = (wr.min(vx + vw) - wl.max(vx)).max(0.0);
-                        let iy = (wb.min(vy + vh) - wt.max(vy)).max(0.0);
-                        if ix < 100.0 || iy < 60.0 {
-                            let nx = (vx + 40.0) / ppp;
-                            let ny = (vy + 40.0) / ppp;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                                egui::pos2(nx, ny),
-                            ));
-                            self.push_log(format!(
-                                "上次的窗口位置已不在任何显示器上（可见 {:.0}×{:.0}），已挪回主屏",
-                                ix, iy
-                            ));
-                        }
-                    }
                 }
             }
         }
@@ -1222,22 +1214,20 @@ mod settings_tests {
 
         let want = Settings {
             zoom: 1.25,
-            window: Some((1280.0, 720.0)),
-            pos: Some((240.0, 120.0)),
+            rect: Some((240, 120, 1520, 840)),   // 物理像素外框：1280×720 @ (240,120)
         };
         want.save();
         assert_eq!(Settings::load(), want, "写进去的缩放/窗口大小要能原样读回");
 
-        // 越界或被写坏的值：zoom 回 1.0，窗口回 None
-        std::fs::write(settings_path(), r#"{"zoom":9.0,"window":[100,50]}"#).unwrap();
+        // 越界或被写坏的值：zoom 回 1.0，rect 回 None
+        std::fs::write(settings_path(), r#"{"zoom":9.0,"rect":[0,0,100,50]}"#).unwrap();
         let bad = Settings::load();
         assert_eq!(bad.zoom, 1.0, "0.6..=2.5 之外的缩放要拒绝");
-        assert_eq!(bad.window, None, "过小的窗口尺寸要拒绝");
-        assert_eq!(bad.pos, None, "没写 pos 字段 = 不指定位置");
+        assert_eq!(bad.rect, None, "尺寸过小的 rect 要拒绝");
 
-        // 离谱坐标（比如 20001）要被拒绝，避免窗口跑到看不见的地方
-        std::fs::write(settings_path(), r#"{"zoom":1.0,"pos":[99999,0]}"#).unwrap();
-        assert_eq!(Settings::load().pos, None, "离谱坐标要拒绝");
+        // 离谱坐标要被拒绝，避免窗口跑到看不见的地方
+        std::fs::write(settings_path(), r#"{"zoom":1.0,"rect":[99999,0,100999,600]}"#).unwrap();
+        assert_eq!(Settings::load().rect, None, "离谱坐标要拒绝");
 
         // 损坏的 JSON 不能 panic
         std::fs::write(settings_path(), "not json").unwrap();
