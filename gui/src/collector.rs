@@ -29,7 +29,65 @@ pub struct Sample {
     pub gu: Option<i32>,
     pub gf: Option<i32>,
     pub mu: Option<i32>,
+    /// 风扇值的原始单位（只影响 UI 后缀显示）
+    pub cf_unit: FanUnit,
+    pub gf_unit: FanUnit,
 }
+
+// ---------------------------------------------------------------- 风扇单位语义
+
+/// 风扇读数的单位。
+///
+/// 固件把 `CF/GF` 当 **RPM** 用：`fan_advance()` 钳 0..3000，转速 = 值/24×1.5 °/s。
+/// 而现实里不是每家都给 RPM：
+///   · SuperIO（主板风扇）、多数 A 卡走 ADL、部分 N 卡 AIB ⇒ 有真实 RPM；
+///   · NVML 对桌面 N 卡多数只给 **百分比**（`nvmlDeviceGetFanSpeed_v2`）。
+///
+/// 约定（2026-10-25 定）：**有 RPM 发 RPM；只有百分比时发 `%×20`（0..2000）**，
+/// 这样屏上风扇转速落在合理区间（100% ⇒ 2000，接近 3000 钳位内），
+/// 同时 UI 在后面标 `%` —— 屏幕转得合理，界面也不骗人。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FanUnit {
+    #[default]
+    Rpm,
+    Percent,
+}
+
+impl FanUnit {
+    pub fn suffix(self) -> &'static str {
+        match self {
+            FanUnit::Rpm => "",
+            FanUnit::Percent => "%",
+        }
+    }
+}
+
+/// 一条风扇读数（带单位），上线前用 `wire()` 转成协议值。
+#[derive(Clone, Copy, Debug)]
+pub struct FanReading {
+    /// 原始读数：RPM 单位时是转/分，Percent 单位时是 0..100
+    pub raw: i32,
+    pub unit: FanUnit,
+}
+
+impl FanReading {
+    pub fn rpm(v: f64) -> Self {
+        Self { raw: v.round() as i32, unit: FanUnit::Rpm }
+    }
+
+    pub fn percent(v: f64) -> Self {
+        Self { raw: v.round().clamp(0.0, 100.0) as i32, unit: FanUnit::Percent }
+    }
+
+    /// 送进链路的数值（RPM 直发；百分比 ×20）。固件再钳一次 0..3000。
+    pub fn wire(&self) -> i32 {
+        match self.unit {
+            FanUnit::Rpm => self.raw.clamp(0, 3000),
+            FanUnit::Percent => ((self.raw as f64) * 20.0).round().clamp(0.0, 2000.0) as i32,
+        }
+    }
+}
+
 
 impl Sample {
     pub fn get(&self, key: &str) -> Option<i32> {
@@ -89,7 +147,9 @@ pub fn lhm_alive() -> bool {
 
 /// 从 LHM 拿 CPU 温度、CPU 风扇、GPU 温度、GPU 风扇。
 /// 返回 (ct, cf, gt, gf)；拿不到的项为 None（**不要用 0 冒充**）。
-fn lhm_sample() -> (Option<i32>, Option<i32>, Option<i32>, Option<i32>) {
+/// 风扇带单位（`FanReading`）：LHM 的叶子值自带单位后缀 —— `1050 RPM` 或 `60 %`，
+/// 这里按后缀判定，不再假设"一定是 RPM"。
+fn lhm_sample() -> (Option<i32>, Option<FanReading>, Option<i32>, Option<FanReading>) {
     let text = match http_get(LHM_URL, "/data.json", 2500) {
         Ok(t) => t,
         Err(_) => return (None, None, None, None),
@@ -106,9 +166,9 @@ fn lhm_sample() -> (Option<i32>, Option<i32>, Option<i32>, Option<i32>) {
 
     let mut cpu_core_max: Option<f64> = None;
     let mut cpu_package: Option<f64> = None;
-    let mut cpu_fan: Option<i32> = None;
+    let mut cpu_fan: Option<FanReading> = None;
     let mut gpu_temp: Option<f64> = None;
-    let mut gpu_fan: Option<i32> = None;
+    let mut gpu_fan: Option<FanReading> = None;
 
     for (path, leaf, value) in &leaves {
         let hw = hw_name(path).to_lowercase();
@@ -147,11 +207,18 @@ fn lhm_sample() -> (Option<i32>, Option<i32>, Option<i32>, Option<i32>) {
             continue;
         }
 
-        if lv.contains("rpm") {
+        // 风扇：叶子值带单位（`1050 RPM` / `60 %`），按后缀判定单位，
+        // 不再假设只可能是 RPM —— NVIDIA 桌面卡在 NVAPI/LHM 里常给百分比。
+        if lv.contains("rpm") || lv.contains('%') {
+            let read = if lv.contains("rpm") {
+                FanReading::rpm(num)
+            } else {
+                FanReading::percent(num)
+            };
             if is_gpu && ll.contains("gpu fan") && gpu_fan.is_none() {
-                gpu_fan = Some(num.round() as i32);
+                gpu_fan = Some(read);
             } else if is_superio && leaf.eq_ignore_ascii_case(CPU_FAN_NAME) {
-                cpu_fan = Some(num.round() as i32);
+                cpu_fan = Some(read);
             }
         }
     }
@@ -161,8 +228,36 @@ fn lhm_sample() -> (Option<i32>, Option<i32>, Option<i32>, Option<i32>) {
     (ct, cpu_fan, gt, gpu_fan)
 }
 
-fn walk(node: &Value, parents: &mut Vec<String>, out: &mut Vec<(Vec<String>, String, String)>) {
-    let text = node.get("Text").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+/// 调试用（`--probe-gpu`）：把 LHM `data.json` 摊平成 (硬件名, 分组, "叶子=值")。
+/// 目的：加 AMD/NVIDIA 支持前先看清"每家显卡在 LHM 里到底叫什么、有哪些叶子"。
+/// LHM 没跑或超时则返回空。
+pub fn lhm_dump_lines() -> Vec<(String, String, String)> {
+    let text = match http_get(LHM_URL, "/data.json", 2500) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let root: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut leaves: Vec<(Vec<String>, String, String)> = Vec::new();
+    walk(&root, &mut Vec::new(), &mut leaves);
+
+    leaves
+        .iter()
+        .map(|(path, leaf, value)| {
+            // 分组 = 叶子前面那一段（Temperatures / Fans / Load / Powers ...）
+            let group = if path.len() >= 2 {
+                path[path.len() - 2].clone()
+            } else {
+                String::new()
+            };
+            (hw_name(path), group, format!("{leaf}={value}"))
+        })
+        .collect()
+}
+
+fn walk(node: &Value, parents: &mut Vec<String>, out: &mut Vec<(Vec<String>, String, String)>) {    let text = node.get("Text").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let value = node.get("Value").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     parents.push(text.clone());
 
@@ -356,6 +451,91 @@ pub fn comm_alive(handle: isize) -> bool {
     unsafe { ClearCommError(handle, &mut err, &mut stat) != 0 }
 }
 
+// ---------------------------------------------------------------- GPU 适配器枚举（DXGI）
+
+/// 一张显卡（来自 DXGI）。
+///
+/// `LUID` 是跨 API 的唯一钥匙：PDH 的实例名里带 `luid_0x<hi>_0x<lo>`，
+/// 厂商库（NVML / ADL）则按 PCI BDF 对卡；将来两者的翻译都靠这张表。
+#[derive(Clone, Debug)]
+pub struct AdapterInfo {
+    pub index: u32,
+    pub name: String,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub dedicated_vram: u64,
+    pub luid_high: u32,
+    pub luid_low: u32,
+    /// DXGI_ADAPTER_FLAG_SOFTWARE：WARP / Basic Render Driver 之类，不是真显卡。
+    pub software: bool,
+}
+
+impl AdapterInfo {
+    /// PDH 实例名里的 LUID 片段。
+    /// 实测形如 `pid_10540_luid_0x00000000_0x00011ce4_phys_0_eng_0_engtype_3d`
+    /// ⇒ **小写、各 8 位、先 High 后 Low**。
+    pub fn luid_tag(&self) -> String {
+        format!("luid_0x{:08x}_0x{:08x}", self.luid_high, self.luid_low)
+    }
+
+    pub fn vendor_name(&self) -> &'static str {
+        match self.vendor_id {
+            0x10DE => "NVIDIA",
+            0x1002 | 0x1022 => "AMD",
+            0x8086 => "Intel",
+            _ => "其它",
+        }
+    }
+
+    pub fn vram_gib(&self) -> f64 {
+        self.dedicated_vram as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+}
+
+/// 枚举所有 DXGI 适配器（**含软件适配器**，用 `software` 标出，调用方自行过滤）。
+pub fn enumerate_adapters() -> Vec<AdapterInfo> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+
+    let mut out = Vec::new();
+    unsafe {
+        let factory: IDXGIFactory1 = match CreateDXGIFactory1() {
+            Ok(f) => f,
+            Err(_) => return out,
+        };
+        let mut i = 0u32;
+        // EnumAdapters1 走到头会返回 DXGI_ERROR_NOT_FOUND，以此作为结束条件。
+        while let Ok(ad) = factory.EnumAdapters1(i) {
+            if let Ok(d) = ad.GetDesc1() {
+                let end = d.Description.iter().position(|&c| c == 0).unwrap_or(128);
+                out.push(AdapterInfo {
+                    index: i,
+                    name: String::from_utf16_lossy(&d.Description[..end]),
+                    vendor_id: d.VendorId,
+                    device_id: d.DeviceId,
+                    dedicated_vram: d.DedicatedVideoMemory as u64,
+                    luid_high: d.AdapterLuid.HighPart as u32,
+                    luid_low: d.AdapterLuid.LowPart,
+                    // DXGI_ADAPTER_FLAG_SOFTWARE == 2
+                    software: (d.Flags & 2) != 0,
+                });
+            }
+            i += 1;
+            if i > 32 {
+                break;                       // 防御：不该有这么多
+            }
+        }
+    }
+    out
+}
+
+/// 选"主 GPU"：跳过软件适配器，取**显存最大**的那张。
+/// 核显+独显、双卡机器上都按这条走；将来界面里会允许手动覆盖。
+pub fn pick_primary_adapter(list: &[AdapterInfo]) -> Option<&AdapterInfo> {
+    list.iter()
+        .filter(|a| !a.software)
+        .max_by_key(|a| a.dedicated_vram)
+}
+
 // ---------------------------------------------------------------- PDH: GPU 使用率
 
 #[repr(C)]
@@ -396,13 +576,43 @@ fn wide(s: &str) -> Vec<u16> {
 ///
 /// 口径与任务管理器一致：同一 engtype 下跨进程求和，再在各 engtype 之间取 max。
 /// 只统计 **engtype_3D**（3D 渲染引擎），这是"GPU 占用"最接近的近似。
+///
+/// ⚠ 2026-10-25 修：原来**不按适配器过滤**，把所有卡的 `engtype_3D` 实例一起相加 ——
+/// 核显+独显（笔记本 / AM5 带 iGPU）会虚高，双卡机器更是错的。
+/// 现在按 LUID 过滤到目标卡（`luid_tag`）；`None` 才退回旧的"全机相加"行为。
 pub struct GpuUsage {
     query: isize,
     counter: isize,
+    luid_tag: Option<String>,
+    /// 上一次采样：命中的实例数 / 全部实例数（诊断用，`--probe-gpu` 会打印）。
+    last_matched: u32,
+    last_total: u32,
+    /// 这张卡的名字（来自 DXGI），用于界面/日志。
+    adapter_name: Option<String>,
 }
 
 impl GpuUsage {
+    /// 自动选主 GPU（显存最大的非软件适配器）。
     pub fn new() -> Option<Self> {
+        let adapters = enumerate_adapters();
+        match pick_primary_adapter(&adapters) {
+            Some(a) => {
+                let tag = a.luid_tag();
+                let name = a.name.clone();
+                let mut g = Self::open(Some(tag))?;
+                g.adapter_name = Some(name);
+                Some(g)
+            }
+            None => Self::open(None),
+        }
+    }
+
+    /// 指定某张卡（按 LUID 的高/低 32 位）。
+    pub fn new_for_luid(luid_high: u32, luid_low: u32) -> Option<Self> {
+        Self::open(Some(format!("luid_0x{luid_high:08x}_0x{luid_low:08x}")))
+    }
+
+    fn open(luid_tag: Option<String>) -> Option<Self> {
         let mut query: isize = 0;
         let mut counter: isize = 0;
         let path = wide(r"\GPU Engine(*)\Utilization Percentage");
@@ -416,7 +626,24 @@ impl GpuUsage {
             // 第一次采集只是建立基线，值不可用
             let _ = PdhCollectQueryData(query);
         }
-        Some(Self { query, counter })
+        Some(Self {
+            query,
+            counter,
+            luid_tag,
+            last_matched: 0,
+            last_total: 0,
+            adapter_name: None,
+        })
+    }
+
+    /// 这张卡的名字（DXGI 描述），拿不到为 None。
+    pub fn adapter_name(&self) -> Option<&str> {
+        self.adapter_name.as_deref()
+    }
+
+    /// (命中实例数, 全部实例数)。用于诊断"过滤条件是否真的匹配上了"。
+    pub fn last_stats(&self) -> (u32, u32) {
+        (self.last_matched, self.last_total)
     }
 
     pub fn sample(&mut self) -> Option<i32> {
@@ -449,21 +676,41 @@ impl GpuUsage {
             let items = std::slice::from_raw_parts(buf.as_ptr() as *const PdhItem, count as usize);
             let mut total_3d = 0.0f64;
             let mut seen_3d = false;
+            let mut matched = 0u32;
+            let mut total_inst = 0u32;
 
             for it in items {
                 if it.name.is_null() {
                     continue;
                 }
                 // 实例名形如
-                //   pid_1234_luid_0x00000000_0x00014890_phys_0_eng_0_engtype_3D
+                //   pid_1234_luid_0x00000000_0x00011ce4_phys_0_eng_0_engtype_3d
                 let name = pcwstr_to_string(it.name);
-                if !name.to_ascii_lowercase().contains("engtype_3d") {
+                let lower = name.to_ascii_lowercase();
+                total_inst += 1;
+
+                // 关键修复：只算目标卡。LUID 片段本身已经含 3D 之外的信息，
+                // 所以先过 LUID，再过 engtype。
+                if let Some(tag) = &self.luid_tag {
+                    if !lower.contains(tag.as_str()) {
+                        continue;
+                    }
+                }
+                if !lower.contains("engtype_3d") {
                     continue;
                 }
+                matched += 1;
                 seen_3d = true;
                 total_3d += it.value.double_value.max(0.0);
             }
 
+            self.last_matched = matched;
+            self.last_total = total_inst;
+
+            // 卡在但是没有任何 3D 引擎实例 ⇒ 这张卡真的闲着，报 0 比 `--` 更准。
+            if !seen_3d && self.luid_tag.is_some() && total_inst > 0 {
+                return Some(0);
+            }
             if !seen_3d {
                 return None;
             }
@@ -493,10 +740,63 @@ pub fn collect(cpu: &mut CpuUsage, gpu: &mut Option<GpuUsage>) -> Sample {
     Sample {
         ct,
         cu: cpu.sample(),
-        cf,
+        // 风扇按单位换算成协议值：RPM 直发，百分比 ×20（见 FanUnit 的说明）
+        cf: cf.map(|f| f.wire()),
         gt,
         gu,
-        gf,
+        gf: gf.map(|f| f.wire()),
         mu: mem_percent(),
+        cf_unit: cf.map(|f| f.unit).unwrap_or(FanUnit::Rpm),
+        gf_unit: gf.map(|f| f.unit).unwrap_or(FanUnit::Rpm),
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+
+    /// 验证两件事（2026-10-25 修 PDH 跨卡求和的回归测试）：
+    ///   1. DXGI 能枚举到适配器，主 GPU 判定 = 显存最大的非软件卡；
+    ///   2. PDH `\GPU Engine` 按该卡 LUID 过滤后**必须命中实例**（命中 0 就说明
+    ///      LUID 片段格式写错了，那时数值会永远 0/虚高）。
+    #[test]
+    fn dxgi_enumeration_and_pdh_luid_filter() {
+        let adapters = enumerate_adapters();
+        assert!(!adapters.is_empty(), "DXGI 至少应枚举到一张适配器");
+
+        for a in &adapters {
+            println!(
+                "[{}] {:<42} vendor={:#06x} vram={:.1}GiB luid={} software={}",
+                a.index, a.name, a.vendor_id, a.vram_gib(), a.luid_tag(), a.software
+            );
+        }
+
+        let p = pick_primary_adapter(&adapters).expect("应存在非软件适配器");
+        println!("primary = {} ({})", p.name, p.vendor_name());
+
+        let mut g = GpuUsage::new_for_luid(p.luid_high, p.luid_low).expect("PDH 查询应能打开");
+        // 速率计数器要两次采集（间隔 ≥200ms）才有值
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let v = g.sample();
+        let (matched, total) = g.last_stats();
+        println!("sample={v:?}  matched={matched}/{total}");
+
+        assert!(total > 0, "PDH 应有 GPU Engine(*)\\Utilization 实例");
+        assert!(matched > 0, "按 LUID 过滤后必须命中实例（否则 LUID 片段格式不对）");
+        if let Some(x) = v {
+            assert!((0..=100).contains(&x), "利用率必须落在 0..100");
+        }
+    }
+
+    /// 风扇单位约定：RPM 直发，百分比 ×20。
+    #[test]
+    fn fan_wire_conversion() {
+        assert_eq!(FanReading::rpm(1050.0).wire(), 1050);
+        assert_eq!(FanReading::rpm(4000.0).wire(), 3000);      // 钳到固件上限
+        assert_eq!(FanReading::percent(60.0).wire(), 1200);    // 60% × 20
+        assert_eq!(FanReading::percent(100.0).wire(), 2000);
+        assert_eq!(FanReading::percent(150.0).wire(), 2000);   // 越界钳位
+        assert_eq!(FanUnit::Percent.suffix(), "%");
+        assert_eq!(FanUnit::Rpm.suffix(), "");
     }
 }

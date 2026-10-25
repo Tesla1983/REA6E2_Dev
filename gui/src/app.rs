@@ -740,7 +740,7 @@ impl App {
                     ui.label(egui::RichText::new(fmt(sample.cu, "%")).size(11.0).monospace().weak());
                     ui.add_space(10.0);
                     ui.checkbox(&mut self.mask.cpu_fan, "风扇");
-                    ui.label(egui::RichText::new(fmt(sample.cf, "")).size(11.0).monospace().weak());
+                    ui.label(egui::RichText::new(fmt(sample.cf, sample.cf_unit.suffix())).size(11.0).monospace().weak());
                 });
             });
         });
@@ -759,7 +759,7 @@ impl App {
                     ui.label(egui::RichText::new(fmt(sample.gu, "%")).size(11.0).monospace().weak());
                     ui.add_space(10.0);
                     ui.checkbox(&mut self.mask.gpu_fan, "风扇");
-                    ui.label(egui::RichText::new(fmt(sample.gf, "")).size(11.0).monospace().weak());
+                    ui.label(egui::RichText::new(fmt(sample.gf, sample.gf_unit.suffix())).size(11.0).monospace().weak());
                 });
             });
         });
