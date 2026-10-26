@@ -18,11 +18,11 @@
         "usb": {
           "vid": "045b",
           "pid": "0263",
-          "serial": "0000000000001"
+          "serial": "43045A764E4B2EB4"
         },
         "chip_uid": "43045a7635333832612a45534e4b2eb4"
       },
-      "identity_note": "USB 序列号是 FSP 模板里写死的 0000000000001，**不唯一**，不能当身份。真身份用芯片 UID：probe-rs read --chip R7FA6E2BB b32 0x01008190 4（BSP_FEATURE_BSP_UNIQUE_ID_POINTER）",
+      "identity_note": "实际 USB 序列号是芯片 UID 派生（前4+后4字节拼接）43045A764E4B2EB4，**唯一且稳定**，可作 USB 身份。早期的 0000000000001 是 FSP 模板写死的非唯一值，已作废。SWD 侧真身佐证：chip_uid=43045a7635333832612a45534e4b2eb4（probe-rs read --chip R7FA6E2BB b32 0x01008190 4）。",
       "firmware": "build/ra6e2_fw.elf",
       "allowed_in": ["E:/REA6E2_Dev"]
     },

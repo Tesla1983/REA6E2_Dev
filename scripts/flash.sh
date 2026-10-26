@@ -7,9 +7,12 @@
 #   ./scripts/flash.sh --elf <path>    # 烧指定 elf (会做安全检查)
 #   ./scripts/flash.sh --check-only    # 只做安全检查, 不烧
 #
-# ⚠⚠ 默认**不自动复位**(见文件里 DO_RESET 的说明):
-#   `probe-rs reset` 只复位内核、不重走 USB 枚举, 实测会把 COM15 弄没。
-#   要跑固件请**物理拔插 Type-C**。确实要探针复位才加 `--reset`。
+# ✅ 默认**自动复位**(DO_RESET=1, 见下方说明):
+#   本机现唯一探针是 FireDAP(0416:5021), 复位行为稳定 —— 烧完直接 reset 唤醒内核跑固件,
+#   不再需要物理拔插 Type-C。
+#   ⚠ 保留事实: `probe-rs reset` 只复位内核、不重走 USB 的 VBUS 枚举, 复位后 USB 仍需等
+#     Windows 重新登记 SERIALCOMM(实测约 30 s, 与物理拔插同量级 —— 这是板子本质,
+#     与探针无关)。需要干净重枚举时可显式 `--no-reset` 改回拔插。
 #
 # 推荐配方 (2026-10-25 起, FireDAP 为唯一探针; 实测可成):
 #   ./scripts/flash.sh --speed 1000 --verify
@@ -52,13 +55,14 @@ ALLOW_OFS=0
 CHECK_ONLY=0
 NO_DBLBUF=0
 CONNECT_UNDER_RESET=0
-# ⚠⚠ 烧完是否自动 `probe-rs reset`。**默认关（DO_RESET=0）**，2026-10-23 晚更正:
-#   `probe-rs reset` **只复位内核**, **不会**重走 USB 的 VBUS 检测 / D+ 上拉 / 枚举。
-#   实测: 烧录成功那一刻 COM15 是在的，reset 之后 COM15 就没了
-#   (`g_usb_cfg_cnt` 1 → 0) ⇒ 对 USB 功能是**有害**的。
-#   要让固件跑起来, 用**物理拔插 Type-C**(真正的冷启动)。
-#   只有做「屏/LCD 类」验证、且明确不需要 USB 时, 才加 `--reset`。
-DO_RESET=0
+# ✅ 烧完是否自动 `probe-rs reset`。**默认开（DO_RESET=1）**，2026-10-25 修订:
+#   旧铁律"禁止 probe-rs reset"是针对**报废的旧 DAPLink(0d28:0204)**(一碰 SWD 就断言、
+#   reset 会把探针状态搅乱)时代的结论, 现已过期。本机现唯一探针 FireDAP(0416:5021) 复位行为正常,
+#   烧完直接 reset 唤醒内核即可, 不必再拔插 Type-C。
+#   ⚠ 保留事实: `probe-rs reset` **只复位内核**, **不会**重走 USB 的 VBUS 检测 / D+ 上拉 / 枚举。
+#     复位后 USB 仍需等 Windows 重新登记 SERIALCOMM(实测约 30 s, 与物理拔插同量级 —— 这是板子本质,
+#     换任何探针都成立)。所以 reset 后 COM 要等 ~30 s 才回来, 属正常。
+DO_RESET=1
 # ⚠ SWD 速率（kHz）。默认 1000 而不是 probe-rs 的自动值:
 #   2026-10-23 用 DAPLink 烧这块板时, 默认速率下 DAP_Transfer 反复 USB 超时
 #   (`Timeout in USB communication` / `Failed to write register DRW`),
@@ -138,19 +142,19 @@ fi
     "${SKIP[@]}" "${EXTRA[@]}" "$ELF"
 RC=$?
 
-# ⚠⚠ 烧完内核可能停在 halt: USB 会停、COM 口消失、屏不刷新。
-# 2026-10-23 晚更正: **默认不复位**。`probe-rs reset` 只复位内核, 不重走 USB 枚举,
-# 实测会把已枚举好的 COM15 弄没(`g_usb_cfg_cnt` 1→0) ⇒ 对 USB 有害。
-# 要跑固件请**物理拔插 Type-C**。确实需要探针复位时加 `--reset`。
+# ✅ 烧完内核可能停在 halt: USB 会停、COM 口消失、屏不刷新。
+# 换 FireDAP(0416:5021) 后默认自动 reset 唤醒内核, 无需拔插。
+# ⚠ 保留事实: `probe-rs reset` 只复位内核, 不重走 USB VBUS 枚举,
+#   复位后 USB 仍需等 Windows 重新登记 SERIALCOMM(实测约 30 s, 与物理拔插同量级)。
 if [[ $RC -eq 0 ]]; then
     if [[ "$DO_RESET" -eq 1 ]]; then
-        echo ">>> 烧录/校验成功, --reset 已指定, 复位运行..."
+        echo ">>> 烧录/校验成功, 自动复位运行(FireDAP 行为正常)..."
         "$PR" reset --chip "$CHIP" --probe "$PROBE" --speed "$SPEED" 2>&1 | tail -3
+        echo ">>> ⏳ 复位后 USB 需等 Windows 重新登记 SERIALCOMM(约 30 s)才出 COM, 属正常。"
     else
         echo ">>> 烧录/校验成功。"
-        echo ">>> ⚠ 未自动复位(默认): 内核可能停在 halt, USB 不会枚举。"
-        echo ">>>   要让固件跑起来, **拔插一次 Type-C**(真正的冷启动), 不要用 probe-rs reset。"
-        echo ">>>   确实需要探针复位: 重跑时加 --reset。"
+        echo ">>> ⚠ 显式 --no-reset: 内核停在 halt, USB 不会枚举。"
+        echo ">>>   要让固件跑起来, 拔插一次 Type-C(真正冷启动)。"
     fi
 else
     echo "" 1>&2
