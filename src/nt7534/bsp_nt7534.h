@@ -108,6 +108,31 @@
 #define NT7534_SPI_BITRATE  (7500000u)
 #endif
 
+/** 风扇动画重绘节拍（ms）。主循环以 2 ms 细片推进，本值须为 2 的倍数。
+ *
+ *  ✅ 2026-10-26 改为**自适应双档**：扇叶真在转 → 高帧；静止 → 自动降帧省 CPU。
+ *     - NT7534_FAN_FRAME_MS_FAST：转动时（有数据 且 至少一台 RPM>0）⇒ 高帧，
+ *       默认 8 ms（≈125 fps，最接近 120 fps，顺滑度最好）。
+ *     - NT7534_FAN_FRAME_MS_IDLE：静止时（无数据 / 或数据在但 RPM=0）⇒ 低帧，
+ *       默认 250 ms（4 fps）。静止相位不前进，低帧只"保活 + 兜底修正"，几乎不占 CPU；
+ *       真正 0 重绘由"无数据"分支承担（整个动画块跳过，靠 1Hz 整屏刷新维持显示）。
+ *
+ *  FAST 取值 ↔ 帧率：
+ *        16 ms → ~60  fps（最省）
+ *        10 ms → 100 fps
+ *         8 ms → 125 fps（默认，转动时 CPU ~18%）
+ *         4 ms → 250 fps（不推荐：OLED 余辉有限，肉眼无差别，纯烧 CPU）
+ *  IDLE 取值 ↔ 帧率：
+ *       250 ms → 4 fps（默认，静止时 ~0.6% CPU）
+ *      1000 ms → 1 fps（与整屏刷新同拍，几乎零占用）
+ *  注意：两档都只决定"多久重画一次风扇格"，与扇叶**转速**无关（转速由 RPM 实时决定）。 */
+#ifndef NT7534_FAN_FRAME_MS_FAST
+#define NT7534_FAN_FRAME_MS_FAST  (8u)
+#endif
+#ifndef NT7534_FAN_FRAME_MS_IDLE
+#define NT7534_FAN_FRAME_MS_IDLE  (250u)
+#endif
+
 /* ---- 引脚 ----
  *
  * ⚠ RS/RES 原本接 P212/P213, 已于 2026-10-22 改到 P403/P409。

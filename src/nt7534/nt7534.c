@@ -254,7 +254,7 @@ static void draw_usb_diag(u8g2_t * g)
  *
  * 风扇: 3 叶 20x20 位图帧(24 帧 = 120° 视觉周期)。相位按 RPM 实时推进 ——
  *   角速度 = RPM/24 度/秒, 与上位机送数频率(1 Hz 也好、别的也好)**完全解耦**;
- *   数据只更新 RPM 值; 动画由主循环 2ms 切片计数自行推进(DWT 在本 M33 上不计, 不用)。
+ *   数据只更新 RPM 值; 动画由主循环 2ms 切片计数自行推进(本 M33 的 DWT CYCCNT 实测可用, 此处未采用)。
  */
 
 /** 两台风扇的相位, 单位 1/100 度。3 叶对称周期 120° = 12000 cd = 24 帧。 */
@@ -262,11 +262,48 @@ static int32_t  s_fan_phase_cd[2] = { 0, 0 };
 
 /** 1 ms 系统心跳（Cortex-M 内核 SysTick 中断驱动）。
  *  为什么要自己开:
- *   - DWT 的 CYCCNT 在本 M33 上**不走**(实测两次读同一个值), 原来那种算法拿不到真实时间;
+ *   - DWT 的 CYCCNT 实测**可用**(2026-10-26 确认: 需先 DWT_LAR 解锁 + DEMCR.TRCENA + DWT_CTRL.CYCCNTENA, 见下方 DWT 块);
  *   - FSP 裸机没有系统时基, USB/串口都不依赖 SysTick, 所以这里自建一个不会打架;
  *   - 中断优先级保持默认(最低), 不会挤掉 USB 中断。
  *  用途: 风扇转速按**真实时间**推进(与帧率无关)、主循环按 1 s 定拍、串口轮询按 50 ms。 */
 volatile uint32_t g_ms_tick = 0u;
+
+/* RA6E2 实测 CPU 占用率。2026-10-26 改用 **DWT CYCCNT 周期计数法**(比早先 SysTick
+ * 累加法更精确): 每 2ms 细片在 R_BSP_SoftwareDelay(2) 软件空转**结束后**读一次 CYCCNT,
+ * 本片所有工作(USB/UART/风扇重绘)结束再读一次, 二者之差(=真正干活周期, 不含空转)累加进
+ * s_cpu_busy_cyc; 每 1s 窗口 load = 忙周期 / 窗口总周期 * 1000 (单位 0.1%)。
+ * 用 0.1% 分辨率是为了 OLED 显示一位小数(如 "19.3%"), 避免四舍五入成整数后看不出波动。 */
+volatile uint16_t g_cpu_load_x10 = 0u;   /* 0..1000, 单位 0.1%, 供 1.3" OLED 显示 "x.x%" */
+volatile uint8_t  g_cpu_load_pct = 0u;   /* 0..100, 整数% (=g_cpu_load_x10/10, 兼容旧调试) */
+
+/* ================= DWT CYCCNT（2026-10-26 实测可用） =================
+ * 此前注释误判"本 M33 上 CYCCNT 不走"——实为未解锁/未使能就直接读。
+ * 实测(按序): 1) DWT_LAR=0xC5ACCE55 解锁  2) DEMCR.TRCENA=1  3) DWT_CTRL.CYCCNTENA=1
+ *   后 CYCCNT 在自由运行下正常递增(1s 增量≈1.21亿, 对应内核~120MHz)。
+ * 此处使能, 现直接用于 CPU 占用率测量(见上方 g_cpu_load_pct 注释); g_dwt_diag 存使能后的
+ * CTRL/DEMCR 值, 可随时 probe-rs 直读确认使能成功。 */
+#define DWT_LAR_REG       (*(volatile uint32_t *)(0xE0001000UL + 0xFB0UL))
+#define DWT_CTRL_REG      (*(volatile uint32_t *)(0xE0001000UL + 0x000UL))
+#define DWT_CYCCNT_REG    (*(volatile uint32_t *)(0xE0001000UL + 0x004UL))
+#define DEMCR_REG         (*(volatile uint32_t *)(0xE000EDFCUL))
+#define DEMCR_TRCENA_BIT  (1UL << 24)
+#define DWT_CYCCNTENA_BIT (1UL << 0)
+
+volatile uint32_t g_dwt_diag[2];   /* [0]=使能后DWT_CTRL [1]=使能后DEMCR(运行期可观测证据) */
+volatile uint32_t g_cpu_dbg_busy  = 0u;   /* 上次 1s 窗口"干活"周期(不含空转), 调试观测 */
+volatile uint32_t g_cpu_dbg_total = 0u;   /* 上次 1s 窗口总周期, 调试观测 */
+
+static void dwt_enable (void)
+{
+    DWT_LAR_REG     = 0xC5ACCE55UL;          /* 1) 解锁 DWT (CoreSight LAR) */
+    DEMCR_REG      |= DEMCR_TRCENA_BIT;       /* 2) 全局跟踪使能 */
+    DWT_CTRL_REG   |= DWT_CYCCNTENA_BIT;      /* 3) 周期计数器使能 */
+    DWT_CYCCNT_REG  = 0u;                     /* 清 0, 从干净起点计数 */
+    g_dwt_diag[0]   = DWT_CTRL_REG;           /* 读回确认 */
+    g_dwt_diag[1]   = DEMCR_REG;
+}
+static uint32_t  s_cpu_busy_cyc     = 0u;   /* 当前 1s 窗口累计"干活"周期(不含空转) */
+static uint32_t  s_window_start_cyc = 0u;   /* 当前 1s 窗口起点的 CYCCNT */
 
 void SysTick_Handler(void)
 {
@@ -747,6 +784,8 @@ void NT7534_Run(void)
     /* 1 ms 心跳(内核 SysTick): 风扇转速/主循环定拍/串口轮询都按真实时间走。 */
     (void) SysTick_Config(SystemCoreClock / 1000u);
 
+    dwt_enable();   /* DWT CYCCNT 已实测可用, 使能供将来高精度计时(见上方定义) */
+
     while (1)
     {
         uint32_t t_loop;
@@ -765,16 +804,23 @@ void NT7534_Run(void)
          *   每轮（约 1 s）清屏重画一次，整屏 1 Hz 刷新。 */
         {
             int32_t t = 0;
+            char    tl[24];
+            char    ll[24];
             if (FSP_SUCCESS == TSN_ReadTemperature(&t))
             {
-                char tl[24];
                 (void) snprintf(tl, sizeof(tl), "T=%ld.%ld C",
                                 (long) (t / 10),
                                 (long) ((t < 0) ? (-(t % 10)) : (t % 10)));
+                /* 第四排(y=48): RA6E2 实测 CPU 占用率, 一位小数(0.1% 精度, 不取整)。
+                 * g_cpu_load_x10 由主循环每 1s 更新(单位 0.1%)。 */
+                (void) snprintf(ll, sizeof(ll), "MCU %2u.%u%%",
+                                (unsigned) (g_cpu_load_x10 / 10u),
+                                (unsigned) (g_cpu_load_x10 % 10u));
                 OLED_Clear();
                 OLED_DrawString(0, 0, "RA6E2 CHIP T");
                 OLED_DrawString(0, 16, tl);
                 OLED_DrawString(0, 32, "TSN->ADC12(-3)");
+                OLED_DrawString(0, 48, ll);
                 OLED_Refresh();
             }
         }
@@ -793,6 +839,7 @@ void NT7534_Run(void)
          *   - 每 1000 ms 结束本轮 ⇒ 数据/状态稳定 1 Hz。原来按片计数(k<500 × 2ms),
          *     但 R_BSP_SoftwareDelay 实测比标称长, 实际一轮 ~1.7 s, 数字就掉到 ~0.6 Hz。 */
         t_loop = g_ms_tick;
+        s_window_start_cyc = DWT_CYCCNT_REG;   /* 本 1s 窗口 CYCCNT 起点 */
         t_uart = t_loop;
         t_anim = t_loop;
 
@@ -801,6 +848,7 @@ void NT7534_Run(void)
             uint32_t now;
 
             R_BSP_SoftwareDelay(2u, BSP_DELAY_UNITS_MILLISECONDS);
+            uint32_t cyc_wd = DWT_CYCCNT_REG;/* 空转结束时刻的周期计数: 此后才计为"干活"(空转不计入) */
             USB_CDC_Poll();
 #if (NT7534_BUS_MODE == 2)
             /* 推进 S3 异步分页刷新状态机(每 2ms 一轮, 8 页 ~11ms 内发完) */
@@ -816,28 +864,71 @@ void NT7534_Run(void)
             }
 #if (0 != U8G2_PORT_ENABLE)
             /* 风扇动画: 按**真实时间**推进, 与上位机送数频率、与帧率都无关。
-             *   - 每 16 ms 一帧(≈60 fps): 只重画右下两格 + 脏刷该区(约 1.5 ms);
-             *   - 相位 = 真实 dt × 1.5(即"角速度 = RPM/24 度/秒 的 1.5 倍");
-             *   - 门控: cf/gf 均为 -1(无数据)时静止, 但风扇照常显示。 */
-            if ((uint32_t) (now - t_anim) >= 16u)
+             *  自适应双档(省 CPU):
+             *   - 扇叶真在转(有数据 且 cf/gf 至少一个 > 0) ⇒ 高帧 NT7534_FAN_FRAME_MS_FAST
+             *     (默认 8 ms ⇒ ≈125 fps, 顺滑度最好);
+             *   - 静止(无数据 / 或数据在但 RPM=0) ⇒ 低帧 NT7534_FAN_FRAME_MS_IDLE
+             *     (默认 250 ms ⇒ ≈4 fps): 相位不前进, 低帧仅"保活 + 兜底修正", 几乎不占 CPU;
+             *     无数据时动画块内部直接跳过(0 重绘), 由 1Hz 整屏刷新维持显示。
+             *  相位 = 真实 dt × 1.5(即"角速度 = RPM/24 度/秒 的 1.5 倍")。 */
             {
-                uint32_t dt = (uint32_t) (now - t_anim);
                 const uart_link_data_t * pd = UART_Link_Data();
+                uint32_t                 fan_interval;
 
-                t_anim = now;
-                if (dt > 100u) { dt = 100u; }        /* 防卡顿后相位大跳 */
-
-                if ((pd->cf >= 0) || (pd->gf >= 0))
+                if (((pd->cf >= 0) || (pd->gf >= 0)) &&
+                    ((pd->cf >  0) || (pd->gf >  0)))
                 {
-                    fan_advance(dt + (dt >> 1));     /* 1.5 倍速 */
-                    draw_fan_cells();
-                    /* 脏区: x54..127 / y32..63 ⇒ tile tx=6(48), tw=10(48..127) */
-                    U8G2_Port_FlushArea(6u, 4u, 10u, 4u);
+                    fan_interval = NT7534_FAN_FRAME_MS_FAST;   /* 转动中: 高帧, 求顺滑 */
+                }
+                else
+                {
+                    fan_interval = NT7534_FAN_FRAME_MS_IDLE;   /* 静止: 降帧省 CPU */
+                }
+
+                if ((uint32_t) (now - t_anim) >= fan_interval)
+                {
+                    uint32_t dt = (uint32_t) (now - t_anim);
+
+                    t_anim = now;
+                    if (dt > 100u) { dt = 100u; }        /* 防卡顿后相位大跳 */
+
+                    if ((pd->cf >= 0) || (pd->gf >= 0))
+                    {
+                        fan_advance(dt + (dt >> 1));     /* 1.5 倍速 */
+                        draw_fan_cells();
+                        /* 脏区: x54..127 / y32..63 ⇒ tile tx=6(48), tw=10(48..127) */
+                        U8G2_Port_FlushArea(6u, 4u, 10u, 4u);
+                    }
                 }
             }
 #endif
+            /* 统计本片"干活"周期(不含 SoftwareDelay 空转)。cyc_end 抓在本片所有工作之后。 */
+            {
+                uint32_t cyc_end = DWT_CYCCNT_REG;
+                s_cpu_busy_cyc += (cyc_end - cyc_wd);   /* 仅真正干活周期, 空转已排在外面 */
+            }
+
             if ((uint32_t) (now - t_loop) >= 1000u)
             {
+                /* 1 s 窗口到: 用 CYCCNT 算 RA6E2 实测 CPU 占用率(%)。
+                 *   numerator = 本窗口累计"干活"周期(已排除空转)
+                 *   denominator = 窗口内总周期(CYCCNT 自由运行)
+                 *   ⇒ 空转天然不计入分母外的分子, 但分母含空转 ⇒ 占用率=真干活占比 */
+                uint32_t cyc_now = DWT_CYCCNT_REG;
+                uint32_t total   = cyc_now - s_window_start_cyc;
+                /* 0.1% 分辨率(*1000): 保留一位小数, 不四舍五入成整数。
+                 * 用 64 位乘法防溢出: busy*1000 在 busy>~4.29M 时必超 uint32(本窗口 busy 可达 ~120M)。 */
+                uint32_t load_x10 = (total > 0u)
+                                   ? (uint32_t) (((uint64_t) s_cpu_busy_cyc * 1000u) / total)
+                                   : 0u;
+                if (load_x10 > 1000u) { load_x10 = 1000u; }
+                g_cpu_load_x10   = (uint16_t) load_x10;
+                g_cpu_load_pct   = (uint8_t)  (load_x10 / 10u);   /* 整数部分(截断), 兼容旧调试 */
+                g_cpu_dbg_busy  = s_cpu_busy_cyc;   /* 调试: 暴露真实 busy/total 供 SWD 直读 */
+                g_cpu_dbg_total = total;
+                s_cpu_busy_cyc   = 0u;
+                s_window_start_cyc = cyc_now;
+
                 break;                               /* 本轮 1 s 到 */
             }
         }
