@@ -13,6 +13,9 @@
  * ============================================================ */
 
 #include "nt7534/bsp_nt7534.h"
+#include "nt7534/nt_bus.h"
+
+#include <string.h>                   /* memcpy: 双缓冲提交用 */
 
 #include "hal_data.h"                  /* g_ioport_ctrl */
 #include "oled/oled_font.h"            /* 8x16 ASCII 字库, 与 OLED 共用 */
@@ -57,6 +60,14 @@ static void nt_pins_as_input(void)
 
     for (i = 0u; i < 5u; i++)
     {
+#if (NT7534_BUS_MODE >= 1)
+        /* 硬件 SPI 模式: CLK(P302)/SID(P207) 已是 SPI0 功能脚,
+         * 改成 GPIO 输入会把 PSEL 清掉, SPI 直接不出波形 -> 必须跳过。 */
+        if ((2u == i) || (3u == i))
+        {
+            continue;
+        }
+#endif
         (void) R_IOPORT_PinCfg(&g_ioport_ctrl, s_nt_pins[i],
                                (uint32_t) IOPORT_CFG_PORT_DIRECTION_INPUT
                                | (uint32_t) IOPORT_CFG_PULLUP_ENABLE);
@@ -67,6 +78,8 @@ static void nt_pins_as_output(void)
 {
     /* 空闲电平: CS/RS/RES/SID 高, CLK 低。
      * 驱动强度取 MID: 就算某根线被接错到 GND, 电流也只有几 mA, 不会伤 MCU 或屏。 */
+#if (NT7534_BUS_MODE == 0)
+    /* 软件 SPI: CLK/SID 必须自己配成 GPIO 输出 */
     (void) R_IOPORT_PinCfg(&g_ioport_ctrl, NT7534_PIN_CLK,
                            (uint32_t) IOPORT_CFG_PORT_DIRECTION_OUTPUT
                            | (uint32_t) IOPORT_CFG_PORT_OUTPUT_LOW
@@ -75,6 +88,10 @@ static void nt_pins_as_output(void)
                            (uint32_t) IOPORT_CFG_PORT_DIRECTION_OUTPUT
                            | (uint32_t) IOPORT_CFG_PORT_OUTPUT_HIGH
                            | (uint32_t) IOPORT_CFG_DRIVE_MID);
+#else
+    /* 硬件 SPI: P302/P207 已由 ra_gen/pin_data.c 配成 SPI0 功能引脚,
+     * 这里绝对不能再碰, 否则 PSEL 被清掉、SPI 不出波形。 */
+#endif
     (void) R_IOPORT_PinCfg(&g_ioport_ctrl, NT7534_PIN_CS,
                            (uint32_t) IOPORT_CFG_PORT_DIRECTION_OUTPUT
                            | (uint32_t) IOPORT_CFG_PORT_OUTPUT_HIGH
@@ -93,7 +110,9 @@ static void nt_pins_as_output(void)
 
 /** 半位延时: 用少量空转控制 NOP 数(不用 R_BSP_SoftwareDelay, 其单次开销太大)。
  *  ⚠ 实测 volatile 16 次空转整屏要 ~30ms(≈273 kbit/s, 远低于 NT7534 可接受的 1.2–1.6 Mbit/s),
- *    说明延时被高估了。降到 4 次 → 约 1.1 Mbit/s(仍在保守范围内), 整屏 ~7–8ms, 可支撑 ~30fps。 */
+ *    说明延时被高估了。降到 4 次 → 约 1.1 Mbit/s(仍在保守范围内), 整屏 ~7–8ms, 可支撑 ~30fps。
+ *  仅 MODE 0 使用。 */
+#if (NT7534_BUS_MODE == 0)
 static void nt_half_delay(void)
 {
     volatile uint32_t i;
@@ -103,8 +122,11 @@ static void nt_half_delay(void)
         __asm__ volatile ("nop");
     }
 }
+#endif
 
-/** 发一个字节（MSB first, CLK 空闲低, 上升沿采样）。 */
+/** 发一个字节（MSB first, CLK 空闲低, 上升沿采样）。
+ *  仅 MODE 0（软件 SPI）使用；硬件 SPI 模式下这块代码不参与编译。 */
+#if (NT7534_BUS_MODE == 0)
 static void nt_write_byte(uint8_t b)
 {
     uint8_t i;
@@ -125,23 +147,32 @@ static void nt_write_byte(uint8_t b)
         nt_half_delay();
         b = (uint8_t) (b << 1);
     }
+}
+#endif
 
-    g_nt_bytes_sent++;
+/** 批量发送：MODE 0 逐字节位打，MODE>=1 整块交给硬件 SPI。
+ *  字节计数放在这里，两种模式都成立（探针可用 g_nt_bytes_sent 判断是否在发数据）。 */
+static void nt_write_bytes(const uint8_t * p, uint32_t n)
+{
+#if (NT7534_BUS_MODE == 0)
+    uint32_t i;
+
+    for (i = 0u; i < n; i++)
+    {
+        nt_write_byte(p[i]);
+    }
+#else
+    NT_Bus_Write(p, n);
+#endif
+
+    g_nt_bytes_sent += n;
 }
 
 static void nt_cmd(uint8_t c)
 {
     NT_CS_LOW();
     NT_RS_CMD();
-    nt_write_byte(c);
-    NT_CS_HI();
-}
-
-static void nt_data(uint8_t d)
-{
-    NT_CS_LOW();
-    NT_RS_DATA();
-    nt_write_byte(d);
+    nt_write_bytes(&c, 1u);
     NT_CS_HI();
 }
 
@@ -171,6 +202,15 @@ void NT7534_PinProbe(void)
     {
         bsp_io_level_t lv = BSP_IO_LEVEL_HIGH;
 
+#if (NT7534_BUS_MODE >= 1)
+        if ((2u == i) || (3u == i))
+        {
+            /* CLK/SID 属 SPI0 功能脚, 未参与自检 -> 记 2 = 未检测（不能记 1, 那会假装"测过且正常"） */
+            g_nt_probe_levels[i] = 2u;
+            continue;
+        }
+#endif
+
         (void) R_IOPORT_PinRead(&g_ioport_ctrl, s_nt_pins[i], &lv);
         g_nt_probe_levels[i] = (uint8_t) ((BSP_IO_LEVEL_HIGH == lv) ? 1u : 0u);
         if (BSP_IO_LEVEL_HIGH != lv)
@@ -184,13 +224,29 @@ void NT7534_PinProbe(void)
 
 void NT7534_BusWrite(uint8_t b)
 {
-    nt_write_byte(b);
+    /* 统一走 nt_write_bytes: 计数与模式选择都在那一处 */
+    nt_write_bytes(&b, 1u);
+}
+
+void NT7534_BusWriteBuf(const uint8_t * p, uint32_t n)
+{
+    nt_write_bytes(p, n);
 }
 
 fsp_err_t NT7534_Init(void)
 {
-    uint8_t page;
-    uint8_t col;
+    static const uint8_t s_zeros[NT7534_WIDTH] = { 0u };
+    uint8_t   page;
+    fsp_err_t err;
+
+    /* 0) 传输层：MODE 0 空操作；MODE>=1 打开 SPI0。
+     *    必须在配引脚之前完成 —— SPI 模式下 P302/P207 的 PSEL 由 BSP 初始化时写好，
+     *    R_SPI_Open 只配寄存器，不再动引脚。 */
+    err = NT_Bus_Init();
+    if (FSP_SUCCESS != err)
+    {
+        return err;
+    }
 
     nt_pins_as_output();
 
@@ -223,10 +279,10 @@ fsp_err_t NT7534_Init(void)
     for (page = 0u; page < NT7534_PAGES; page++)
     {
         nt_set_page_col(page, 0u);
-        for (col = 0u; col < NT7534_WIDTH; col++)
-        {
-            nt_data(0x00u);
-        }
+        NT_CS_LOW();
+        NT_RS_DATA();
+        nt_write_bytes(s_zeros, NT7534_WIDTH);
+        NT_CS_HI();
     }
 
     nt_cmd(0xAFu);                     /* 显示 ON */
@@ -282,8 +338,7 @@ void NT7534_Clear(void)
 
 void NT7534_Refresh(void)
 {
-    uint8_t  page;
-    uint8_t  col;
+    uint8_t page;
 
     /* 每帧重申几何/极性: 屏只写不读, 无法回读校验, 只能不断重申。
      * 这一步也是"控制器状态被弄乱后一帧自愈"的全部实现, 详见头文件说明。 */
@@ -296,11 +351,12 @@ void NT7534_Refresh(void)
         const uint8_t * p_src = &s_fb[(((uint32_t) page + NT7534_PAGE_ROT) & 7u) * NT7534_WIDTH];
 
         nt_set_page_col(page, 0u);
+        /* 一整页 128 字节压缩在同一个 CS 低电平窗口里发完:
+         * 软件 SPI 下少 127 次 CS 翻转, 硬件 SPI 下正好是一次 DMA/一次传输。 */
+        NT_CS_LOW();
         NT_RS_DATA();
-        for (col = 0u; col < NT7534_WIDTH; col++)
-        {
-            nt_data(p_src[col]);
-        }
+        nt_write_bytes(p_src, NT7534_WIDTH);
+        NT_CS_HI();
     }
 }
 
@@ -447,3 +503,198 @@ void NT7534_FillRect(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint8_t on)
         }
     }
 }
+
+#if (NT7534_BUS_MODE == 2)
+/* ============================================================
+ * S3 异步分页刷新状态机（双缓冲版 —— 消除数值更新时的撕裂/闪烁）
+ *
+ * 旧版缺陷（ tearing / 闪烁根因）:
+ *   泵异步分页推进（主循环每 2ms 推一页，整屏约 16ms 才画完），
+ *   而渲染任务在 DMA 还在飞的时候就在改写 live 缓冲 g_u8g2_fb：
+ *     - 风扇动画每 16ms 重写第 4~7 页
+ *     - 整屏每 1s 走 u8g2_ClearBuffer 后全量重画
+ *   旧版 nt_pump_start_page() 直接 DMA 读 g_u8g2_fb，于是某一页发到一半时
+ *   缓冲已被下一帧改写 -> 同一屏里部分旧、部分新 -> 看到"数值一变就跳动/闪烁"。
+ *
+ * 修法：加一层影子缓冲 g_nt_shadow。
+ *   - 只有"泵空闲"或"一页刚发完的安全边界"才把 live 缓冲按页拷进 shadow
+ *     （nt_pump_commit），DMA 永远只读 shadow，永远看不到改写中的 live 缓冲。
+ *   - 渲染（draw_layout_a / draw_fan_cells）只写 live 缓冲，与 DMA 彻底解耦。
+ *   - 泵忙时新请求按页位图 s_pending 排队，当前 pass 发完再补发，不丢帧、不跳过。
+ *
+ * 为什么 CS 必须自己管(不能交给 u8g2 的 cad):
+ *   NT7534 每页 = 3 字节页地址命令(CS 低/RS 命令) + 128 字节数据(CS 低/RS 数据)，
+ *   两者必须在同一个 CS 低电平窗口内；u8g2 的 cad 发完一页会拉高 CS，
+ *   若数据改成异步，CS 会在 DMA 没发完就被拉高 => 花屏。
+ *   所以 S3 完全绕过 u8g2_SendBuffer，直接读 shadow 自己分页发。
+ *
+ * 页号映射：写到 controller 第 page 页的数据取自缓冲第 (page + NT7534_PAGE_ROT) & 7 页
+ *   （本模块 RAM→玻璃固定上移 32 行，起始行命令无效，在提交侧补偿；见 bsp_nt7534.h）。
+ * ============================================================ */
+
+extern uint8_t g_u8g2_fb[1024];     /* u8g2 帧缓冲, u8g2_port.c 里定义 */
+
+/** 影子缓冲：DMA 唯一读取来源。只在泵空闲/安全边界被写入，发送期间恒定稳定。 */
+static uint8_t        g_nt_shadow[NT7534_PAGES * NT7534_WIDTH];
+static volatile uint32_t s_committed = 0u;   /* 已拷进 shadow、待发的页位图（bit p = 页 p） */
+static volatile uint32_t s_pending   = 0u;   /* 已请求、还没拷进 shadow 的页位图 */
+static volatile int      s_cur       = -1;   /* 当前正在发的页；-1 = 空闲 */
+
+/** 把 live 缓冲的指定页（按旋转映射）拷进 shadow。仅在泵空闲/安全边界调用。 */
+static void nt_pump_commit(uint32_t mask)
+{
+    uint8_t p;
+
+    for (p = 0u; p < NT7534_PAGES; p++)
+    {
+        if (0u != (mask & (1u << p)))
+        {
+            const uint8_t * src = &g_u8g2_fb[(((uint32_t) p + NT7534_PAGE_ROT) & 7u) * NT7534_WIDTH];
+            uint8_t       * dst = &g_nt_shadow[(uint32_t) p * NT7534_WIDTH];
+
+            (void) memcpy(dst, src, NT7534_WIDTH);
+        }
+    }
+}
+
+/** 发一页的 3 字节页地址命令(阻塞, ~0.4µs @7.5MHz); CS 拉低、RS 切命令。 */
+static void nt_pump_send_page_cmd(uint8_t page)
+{
+    uint8_t c   = (uint8_t) (0u + s_col_offset);   /* 列偏移(厂家 demo 用 +1) */
+    uint8_t cmd[3];
+
+    cmd[0] = (uint8_t) (0xB0u | (page & 0x0Fu));
+    cmd[1] = (uint8_t) (0x10u | ((c >> 4) & 0x0Fu));
+    cmd[2] = (uint8_t) (c & 0x0Fu);
+
+    NT_CS_LOW();
+    NT_RS_CMD();
+    nt_write_bytes(cmd, 3u);     /* 阻塞, 走 NT_Bus_Write */
+    NT_RS_DATA();                /* 切数据, CS 保持低, 等 DMA 把 128 字节发完 */
+}
+
+/** 从 shadow 发起一页的异步 DMA 发送; 成功返回 true。 */
+static bool nt_pump_send_page(uint8_t page)
+{
+    const uint8_t * src = &g_nt_shadow[(uint32_t) page * NT7534_WIDTH];
+
+    nt_pump_send_page_cmd(page);
+
+    if (NT_Bus_WriteAsync(src, NT7534_WIDTH))
+    {
+        g_nt_dma_kicks++;
+        return true;
+    }
+
+    /* 异步起点失败(总线仍忙, 理论上不会发生): 放弃本次, 拉高 CS 收尾 */
+    NT_CS_HI();
+    return false;
+}
+
+/** 从 s_committed 里挑最低页发出; 没有可发的页则置空闲。 */
+static void nt_pump_advance(void)
+{
+    uint8_t p;
+    int     next = -1;
+
+    for (p = 0u; p < NT7534_PAGES; p++)
+    {
+        if (0u != (s_committed & (1u << p)))
+        {
+            next = (int) p;
+            break;
+        }
+    }
+
+    if (next < 0)
+    {
+        s_cur = -1;
+        return;
+    }
+
+    s_cur = next;
+    if (!nt_pump_send_page((uint8_t) next))
+    {
+        /* 异步起点失败(总线仍忙): 清空本轮, 下一轮 Poll 会按 s_pending 补发 */
+        s_cur       = -1;
+        s_committed = 0u;
+    }
+}
+
+void NT7534_Pump_Start(uint8_t first_page, uint8_t last_page)
+{
+    uint8_t  p;
+    uint32_t mask = 0u;
+
+    for (p = first_page; p <= last_page; p++)
+    {
+        mask |= (1u << p);
+    }
+
+    NT7534_Pump_StartBitmap(mask);
+}
+
+void NT7534_Pump_StartBitmap(uint32_t mask)
+{
+    if (0u == mask)
+    {
+        return;
+    }
+
+    if (s_cur >= 0)
+    {
+        /* 泵忙: 排队。本轮发完会在 Poll 里补发, 不丢帧、不跳过 */
+        s_pending |= mask;
+        return;
+    }
+
+    /* 空闲: 立即提交 live→shadow 并启动 */
+    s_committed = mask;
+    s_pending   = 0u;
+    nt_pump_commit(s_committed);
+    nt_pump_advance();
+}
+
+void NT7534_Pump_Poll(void)
+{
+    if (s_cur < 0)
+    {
+        /* 空闲: 有排队请求就补发 */
+        if (s_pending)
+        {
+            s_committed = s_pending;
+            s_pending   = 0u;
+            nt_pump_commit(s_committed);
+            nt_pump_advance();
+        }
+        return;
+    }
+
+    if (!NT_Bus_IsIdle())
+    {
+        return;     /* 当前页 DMA 还在飞, 让出 CPU, 下一轮再来看 */
+    }
+
+    /* 当前页发完: 拉高 CS, 从已提交位图摘除, 推进下一页 */
+    NT_CS_HI();
+    s_committed &= ~(1u << (uint8_t) s_cur);
+
+    if (s_committed)
+    {
+        nt_pump_advance();
+    }
+    else if (s_pending)
+    {
+        s_committed = s_pending;
+        s_pending   = 0u;
+        nt_pump_commit(s_committed);
+        nt_pump_advance();
+    }
+    /* 否则彻底空闲, 等下一次 Pump_Start */
+}
+
+bool NT7534_Pump_Active(void)
+{
+    return (s_cur >= 0);
+}
+#endif /* NT7534_BUS_MODE == 2 */

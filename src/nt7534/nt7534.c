@@ -802,6 +802,10 @@ void NT7534_Run(void)
 
             R_BSP_SoftwareDelay(2u, BSP_DELAY_UNITS_MILLISECONDS);
             USB_CDC_Poll();
+#if (NT7534_BUS_MODE == 2)
+            /* 推进 S3 异步分页刷新状态机(每 2ms 一轮, 8 页 ~11ms 内发完) */
+            NT7534_Pump_Poll();
+#endif
 
             now = g_ms_tick;
             if ((uint32_t) (now - t_uart) >= 50u)

@@ -83,6 +83,31 @@
  *  NT7534 串行时钟上限不高, 慢一点最稳; 1 Hz 刷新完全够。 */
 #define NT7534_HALF_BIT_US  (1u)
 
+/* ---- 传输层选择 ----
+ *   0 = 软件位打（默认，v24 行为，完全不变）
+ *   1 = 硬件 SPI0 阻塞（DMAC 在底层搬字节，但整屏刷等 DMA 完成时主循环被占 1.4ms）
+ *   2 = 硬件 SPI0 + DMAC 异步分页刷新（S3：8 页状态机，主循环不再被刷新阻塞）
+ * 切换只需改这一行；改回 0 即完整回退，引脚由驱动重新配成 GPIO；
+ * 改回 1 即退回"阻塞整屏"但不动分页状态机代码（S3 出问题时的最快降级档）。 */
+#ifndef NT7534_BUS_MODE
+#define NT7534_BUS_MODE     (2)
+#endif
+
+/** 硬件 SPI0 的目标位率（Hz）。实际分频由 R_SPI_CalculateBitrate() 现算，
+ *  受 PCLKA=60 MHz 限制只能取 60M/2^n：30M / 15M / 7.5M / 3.75M / 1.875M / 937.5k。
+ *
+ *  ✅ 2026-10-26 实测定档 **7.5 MHz**（SPBR=3, BRDV=0）。
+ *     逐档验证过程：937.5k → 1.875M → 3.75M → 7.5M，每档烧录后目视检查
+ *     （表格线连续、数字笔画完整、风扇边缘无毛刺、连续观察 20 s 无累积错位），
+ *     四档全部正常。注意 7.5 MHz 已是这类 NT7534/ST7565 类控制器
+ *     **标称串行时钟上限（约 2.5 MHz）的 3 倍**，能跑属于"实测超规格可用"，
+ *     不同批次的屏/更长的排线未必都行 —— 所以保留本宏，出问题就往下调一档：
+ *       3.75M → 1.875M → 937.5k
+ *     （每次改这一行后重新编译烧录即可，分频会自动重算，不需要动 RASC。） */
+#ifndef NT7534_SPI_BITRATE
+#define NT7534_SPI_BITRATE  (7500000u)
+#endif
+
 /* ---- 引脚 ----
  *
  * ⚠ RS/RES 原本接 P212/P213, 已于 2026-10-22 改到 P403/P409。
@@ -121,6 +146,12 @@ fsp_err_t NT7534_Init(void);
 /** 向屏发一个字节（RS/CS 由调用方自己控制）。
  *  只给 u8g2 移植层用: u8g2 自己管 RS/CS 与命令数据流, 只需要"把这一个字节轰到 SPI 上"。 */
 void NT7534_BusWrite(uint8_t b);
+
+/** 批量发送（一次调用 = 一次 SPI 传输）。
+ *  MODE 0 时等价于逐字节 nt_write_byte; MODE>=1 时整块交给硬件 SPI。
+ *  ⚠ 上层应尽量用这个而不是循环调 NT7534_BusWrite —— 后者在硬件 SPI 下会变成
+ *    每字节一次传输，开销被放大 128 倍。 */
+void NT7534_BusWriteBuf(const uint8_t * p, uint32_t n);
 
 /** 全点亮 / 恢复正常显示: on=1 -> 0xA5（所有像素点亮）, on=0 -> 0xA4 */
 void NT7534_AllPointsOn(uint8_t on);
@@ -177,5 +208,21 @@ void NT7534_DrawRect(int16_t x0, int16_t y0, int16_t x1, int16_t y1);
 
 /** 填充实心矩形 */
 void NT7534_FillRect(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint8_t on);
+
+#if (NT7534_BUS_MODE == 2)
+/* ---- S3 异步分页刷新状态机 ----
+ *  U8G2_Port_Flush()/U8G2_Port_FlushArea() 触发, 主循环每轮调 NT7534_Pump_Poll() 推进。
+ *  把整屏 8 页拆成"一页一笔异步 DMA", 发完一页不等下一页、直接让出 CPU;
+ *  DMA 在飞时主循环去干串口/USB/风扇, 整屏刷新的 1.4ms 不再阻塞主循环。
+ *  CS 由本状态机自己管: 一页的 3 字节地址命令(阻塞, ~0.4µs) + 128 字节数据(异步 DMA)
+ *  必须在同一个 CS 低电平窗口内完成, 所以数据 DMA 回来之前 CS 不拉高。
+ *  first/last 为 controller 页号(0..7), 含端点。
+ *  NT7534_Pump_StartBitmap() 接受 controller 页位图(mask 的 bit p = 第 p 页),
+ *  供 U8G2_Port_FlushArea() 在做了 NT7534_PAGE_ROT 反变换后调用。 */
+void NT7534_Pump_Start(uint8_t first_page, uint8_t last_page);
+void NT7534_Pump_StartBitmap(uint32_t page_mask);
+void NT7534_Pump_Poll(void);
+bool NT7534_Pump_Active(void);
+#endif
 
 #endif /* BSP_NT7534_H_ */

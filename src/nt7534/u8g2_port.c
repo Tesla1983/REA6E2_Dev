@@ -73,22 +73,37 @@ static uint8_t port_byte_cb(u8x8_t * u8x8, uint8_t msg, uint8_t arg_int, void * 
         case U8X8_MSG_BYTE_SEND:
         {
             const uint8_t * p = (const uint8_t *) arg_ptr;
-            uint8_t         i;
+            /* 整块转交给传输层: 硬件 SPI 下一次调用 = 一次 SPI 传输（一页最多 128 B）。
+             * 逐字节调 NT7534_BusWrite 会把 128 字节拆成 128 次传输，开销放大两个数量级。 */
+            static uint8_t s_xfer[NT7534_WIDTH];
 
-            for (i = 0u; i < arg_int; i++)
+            uint32_t  i = 0u;
+            uint32_t  n = (uint32_t) arg_int;
+
+            while (i < n)
             {
-                uint8_t b = p[i];
+                uint32_t k = 0u;
 
-                /* 页地址补偿: 命令 0xB0..0xB7 = "set page"。
-                 * 本模块 RAM→玻璃固定上移 32 行（= 4 页），起始行命令对它无效，
-                 * 只能在这里把页号转一下。见 bsp_nt7534.h 的 NT7534_PAGE_ROT。
-                 * 0xB8..0xBF 是别的命令, 不能当页号处理, 所以用掩码精确匹配。 */
-                if ((0u != s_is_cmd) && (0xB0u == (b & 0xF8u)))
+                while ((i < n) && (k < (uint32_t) sizeof(s_xfer)))
                 {
-                    b = (uint8_t) (0xB0u | (((uint8_t) (b + NT7534_PAGE_ROT)) & 0x07u));
+                    uint8_t b = p[i];
+
+                    i++;
+
+                    /* 页地址补偿: 命令 0xB0..0xB7 = "set page"。
+                     * 本模块 RAM→玻璃固定上移 32 行（= 4 页），起始行命令对它无效，
+                     * 只能在这里把页号转一下。见 bsp_nt7534.h 的 NT7534_PAGE_ROT。
+                     * 0xB8..0xBF 是别的命令, 不能当页号处理, 所以用掩码精确匹配。 */
+                    if ((0u != s_is_cmd) && (0xB0u == (b & 0xF8u)))
+                    {
+                        b = (uint8_t) (0xB0u | (((uint8_t) (b + NT7534_PAGE_ROT)) & 0x07u));
+                    }
+
+                    s_xfer[k] = b;
+                    k++;
                 }
 
-                NT7534_BusWrite(b);
+                NT7534_BusWriteBuf(s_xfer, k);
             }
             return 1u;
         }
@@ -183,13 +198,45 @@ void U8G2_Port_Flush(void)
     /* 每帧重申方向 + 起始行（3 字节, 约 0.3% 带宽）。
      * 屏只写不读, 控制器状态一旦被打乱没法察觉, 靠这个自动恢复。 */
     NT7534_SyncGeometry();
+
+#if (NT7534_BUS_MODE == 2)
+    /* S3: 异步分页刷新, 不阻塞主循环(见 NT7534_Pump_Poll)。 */
+    NT7534_Pump_Start(0u, (uint8_t) (NT7534_PAGES - 1u));
+#else
     u8g2_SendBuffer(&s_u8g2);
+#endif
     g_u8g2_frames++;
 }
 
 void U8G2_Port_FlushArea(uint8_t tx, uint8_t ty, uint8_t tw, uint8_t th)
 {
+#if (NT7534_BUS_MODE == 2)
+    /* S3: 脏区 = u8g2 帧缓冲里涉及的页范围(tile 行 = 页, 每页 8 行)。
+     *   ⚠ 关键: 帧缓冲第 L 页的内容实际显示在 controller 第 (L - NT7534_PAGE_ROT) & 7
+     *   页(玻璃上移了 NT7534_PAGE_ROT 页, 起始行命令无效, 发送侧补偿)。所以必须把
+     *   u8g2 页号反变换成 controller 物理页, 再交给泵——否则会刷错页、风扇根本不被刷新。
+     *     例: 风扇画在 u8g2 页 4..7 => 物理页 (4-4..7-4)&7 = 0..3, 只刷 0..3 才能让扇叶转。
+     *   列地址不必重设(u8g2 缓冲里已是最终像素, commit 整页拷贝)。 */
+    uint8_t  a = ty;
+    uint8_t  b = (uint8_t) (ty + th - 1u);
+    uint8_t  p;
+    uint32_t mask = 0u;
+
+    (void) tx;
+    (void) tw;
+    if (b > (NT7534_PAGES - 1u))
+    {
+        b = (uint8_t) (NT7534_PAGES - 1u);
+    }
+    for (p = a; p <= b; p++)
+    {
+        uint8_t phys = (uint8_t) ((p + NT7534_PAGES - NT7534_PAGE_ROT) & 7u);
+        mask |= (1u << phys);
+    }
+    NT7534_Pump_StartBitmap(mask);
+#else
     /* 只发送指定 tile 区域: 风扇动画每帧只刷右下两格(约 288B vs 全屏 1024B)。 */
     u8g2_UpdateDisplayArea(&s_u8g2, tx, ty, tw, th);
+#endif
     g_u8g2_frames++;
 }

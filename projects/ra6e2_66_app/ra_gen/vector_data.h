@@ -6,7 +6,7 @@
         #endif
                 /* Number of interrupts allocated */
         #ifndef VECTOR_DATA_IRQ_COUNT
-        #define VECTOR_DATA_IRQ_COUNT    (10)
+        #define VECTOR_DATA_IRQ_COUNT    (14)
         #endif
         /* ISR prototypes */
         void usbfs_interrupt_handler(void);
@@ -19,6 +19,10 @@
         void iic_b_master_txi_isr(void);
         void iic_b_master_tei_isr(void);
         void iic_b_master_eri_isr(void);
+        void spi_rxi_isr(void);
+        void spi_tei_isr(void);
+        void spi_eri_isr(void);
+        void dmac_int_isr(void);
 
         /* Vector table allocations */
         #define VECTOR_NUMBER_USBFS_INT ((IRQn_Type) 0) /* USBFS INT (USBFS interrupt) */
@@ -41,8 +45,16 @@
         #define IICB0_TEI_IRQn          ((IRQn_Type) 8) /* IICB0 TEI (Transmit end) */
         #define VECTOR_NUMBER_IICB0_ERI ((IRQn_Type) 9) /* IICB0 ERI (Error) */
         #define IICB0_ERI_IRQn          ((IRQn_Type) 9) /* IICB0 ERI (Error) */
+        #define VECTOR_NUMBER_SPI0_RXI ((IRQn_Type) 10) /* SPI0 RXI (Receive buffer full) */
+        #define SPI0_RXI_IRQn          ((IRQn_Type) 10) /* SPI0 RXI (Receive buffer full) */
+        #define VECTOR_NUMBER_SPI0_TEI ((IRQn_Type) 11) /* SPI0 TEI (Transmission complete event) */
+        #define SPI0_TEI_IRQn          ((IRQn_Type) 11) /* SPI0 TEI (Transmission complete event) */
+        #define VECTOR_NUMBER_SPI0_ERI ((IRQn_Type) 12) /* SPI0 ERI (Error) */
+        #define SPI0_ERI_IRQn          ((IRQn_Type) 12) /* SPI0 ERI (Error) */
+        #define VECTOR_NUMBER_DMAC0_INT ((IRQn_Type) 13) /* DMAC0 INT (DMAC0 transfer end) */
+        #define DMAC0_INT_IRQn          ((IRQn_Type) 13) /* DMAC0 INT (DMAC0 transfer end) */
         /* The number of entries required for the ICU vector table. */
-        #define BSP_ICU_VECTOR_NUM_ENTRIES (10)
+        #define BSP_ICU_VECTOR_NUM_ENTRIES (14)
 
         #ifdef __cplusplus
         }

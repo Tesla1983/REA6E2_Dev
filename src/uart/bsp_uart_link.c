@@ -49,6 +49,21 @@ static uart_link_data_t s_data;
 /** 接收超时（毫秒）。收到合法帧时重置为 2000, 每 Tick 递减。 */
 static volatile uint16_t s_alive_ms = 0u;
 
+/** 把全部字段置 -1（= 无数据）。
+ *  三处用：① 上电初始化；② 每帧解析前先清，未上报的键自然留 -1；③ **断链时清一次**。
+ *  断链必须清：否则屏上保留上一次的读数、风扇按旧 RPM 继续转，
+ *  看起来像"还在实时刷新"，与 unlink 状态自相矛盾（2026-10-26 用户反馈）。 */
+static void link_data_clear(void)
+{
+    s_data.ct = -1;
+    s_data.cu = -1;
+    s_data.cf = -1;
+    s_data.gt = -1;
+    s_data.gu = -1;
+    s_data.gf = -1;
+    s_data.mu = -1;
+}
+
 /* ---------------- 小工具 ---------------- */
 
 /** 十六进制字符 → 数值；非法返回 -1 */
@@ -336,13 +351,7 @@ static bool parse_line(void)
     }
 
     /* 逐段解析 KEY:VALUE, 段之间用 ',' 分隔 */
-    s_data.ct = -1;
-    s_data.cu = -1;
-    s_data.cf = -1;
-    s_data.gt = -1;
-    s_data.gu = -1;
-    s_data.gf = -1;
-    s_data.mu = -1;
+    link_data_clear();
 
     i = 1u;
     while (i < star)
@@ -371,17 +380,12 @@ static bool parse_line(void)
 
 /* ---------------- 对外接口 ---------------- */
 
+/** 把全部字段置 -1（= 无数据）。 */
 fsp_err_t UART_Link_Init(void)
 {
     fsp_err_t err;
 
-    s_data.ct = -1;
-    s_data.cu = -1;
-    s_data.cf = -1;
-    s_data.gt = -1;
-    s_data.gu = -1;
-    s_data.gf = -1;
-    s_data.mu = -1;
+    link_data_clear();
 
     err = g_uart0.p_api->open(&g_uart0_ctrl, &g_uart0_cfg);
     if (FSP_SUCCESS != err)
@@ -525,7 +529,13 @@ void UART_Link_Tick(uint16_t elapsed_ms)
     }
     else
     {
-        s_alive_ms = 0u;
+        /* 走完 2 s 没收到合法帧 ⇒ 判定断链。
+         * 只在"从在线变离线"的那一次清数据，之后每 50 ms 调一次也不会反复清。 */
+        if (0u != s_alive_ms)
+        {
+            s_alive_ms = 0u;
+            link_data_clear();   /* 读数回 --，风扇门控失效 ⇒ 停转（仍照常画静止风扇） */
+        }
     }
 }
 
