@@ -948,7 +948,7 @@ impl App {
                 }
 
                 ui.label(egui::RichText::new("RA6E2 系统监控台").size(14.0).strong());
-                ui.label(egui::RichText::new("v0.1").size(11.0).weak());
+                ui.label(egui::RichText::new("v1.0.0").size(11.0).weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // right_to_left 布局：先加的在上层（最右），所以"设置"在最右边
                     ui.menu_button("设置", |ui| {
