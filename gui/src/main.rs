@@ -2,6 +2,7 @@
 
 mod app;
 mod board;
+mod i18n;
 mod collector;
 mod gpu;
 mod lhm;

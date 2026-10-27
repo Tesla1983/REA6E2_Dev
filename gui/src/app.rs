@@ -10,6 +10,7 @@ use eframe::egui;
 use crate::board::{self, Board};
 use crate::collector::{self, CpuUsage, GpuUsage, Sample};
 use crate::gpu::{AdapterKey, Source};
+use crate::i18n::{status_text, Lang, LogMsg, T};
 
 // ---------------------------------------------------------------- 共享状态
 
@@ -103,9 +104,9 @@ pub struct App {
     scanning: bool,
     running: bool,
     mask: Mask,
-    log: Vec<String>,
-    log_rx: Receiver<String>,
-    log_tx: Sender<String>,
+    log: Vec<(String, LogMsg)>,
+    log_rx: Receiver<LogMsg>,
+    log_tx: Sender<LogMsg>,
     scan_rx: Option<Receiver<Vec<Board>>>,
     shared: Arc<Mutex<Shared>>,
     mask_shared: Arc<Mutex<Mask>>,
@@ -113,6 +114,8 @@ pub struct App {
     /// 界面缩放（= 字体与控件大小）。1.0 = 100%，持久化到 %LOCALAPPDATA%。
     /// 每帧从 `ctx.zoom_factor()` 同步（缩放菜单和 Ctrl+滚轮都会改它）。
     zoom: f32,
+    /// 界面语言。默认中文（零回归），顶栏按钮切换后随 `Settings` 持久化。
+    lang: Lang,
     /// 已落盘的偏好（用来判断有没有变化）
     saved: Settings,
     /// 正在变化中的偏好 + 最后一次变化的时刻（去抖：停手 600ms 再写盘）
@@ -147,9 +150,10 @@ impl App {
         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
         cc.egui_ctx.set_visuals(build_visuals());
 
-        // 读上次的界面偏好（缩放 + 窗口大小）；窗口大小由 main.rs 建窗口时用
+        // 读上次的界面偏好（缩放 + 窗口大小 + 语言）；窗口大小由 main.rs 建窗口时用
         let saved = Settings::load();
         let zoom = saved.zoom;
+        let lang = saved.lang;
         cc.egui_ctx.set_zoom_factor(zoom);
 
         // 系统托盘：独立线程 + 自己的消息循环（见 tray.rs）
@@ -175,6 +179,7 @@ impl App {
             mask_shared: Arc::new(Mutex::new(Mask::default())),
             font_note,
             zoom,
+            lang,
             saved,
             pending: saved,
             last_change: None,
@@ -185,19 +190,21 @@ impl App {
             _tray_quit: tray_quit,
             hidden_to_tray: false,
         };
-        app.push_log(format!("中文字体: {}", app.font_note.clone()));
-        app.push_log(format!("界面缩放: {:.0}%", app.zoom * 100.0));
+        app.push_log(LogMsg::Font(app.font_note.clone()));
+        app.push_log(LogMsg::Zoom((app.zoom * 100.0) as u32));
         if cached.is_empty() {
-            app.push_log("缓存: 空（首启动，等扫描识别）".into());
+            app.push_log(LogMsg::CacheEmpty);
         } else {
             for b in &cached {
-                app.push_log(format!(
-                    "缓存: {} → {}（固件 {}）{}",
-                    b.port,
-                    b.id.clone().unwrap_or_else(|| "—".into()),
-                    b.fw.map(|v| format!("v{v}")).unwrap_or_else(|| "—".into()),
-                    if b.online { "在线" } else { "未插" }
-                ));
+                app.push_log(LogMsg::CacheEntry {
+                    port: b.port.clone(),
+                    id: b.id.clone().unwrap_or_else(|| "—".into()),
+                    fw: b
+                        .fw
+                        .map(|v| format!("v{v}"))
+                        .unwrap_or_else(|| "—".into()),
+                    online: b.online,
+                });
             }
         }
         // ---- 恢复上次的窗口位置/尺寸 ----
@@ -225,9 +232,9 @@ impl App {
                 app.saved.rect = Some((x, y, x + w, y + h));
                 app.pending = app.saved;
                 app.rect_applied = true;
-                app.push_log(format!("已恢复窗口位置/尺寸: {w}×{h} @ ({x}, {y})"));
+                app.push_log(LogMsg::WindowRestored { w, h, x, y });
             } else {
-                app.push_log("恢复窗口位置失败（还没找到主窗口），第一帧再试".into());
+                app.push_log(LogMsg::WindowRestoreFailed);
             }
         }
 
@@ -245,9 +252,9 @@ impl App {
         app
     }
 
-    fn push_log(&mut self, s: String) {
+    fn push_log(&mut self, m: LogMsg) {
         let ts = chrono_like_now();
-        self.log.push(format!("{ts} {s}"));
+        self.log.push((ts, m));
         if self.log.len() > 300 {
             self.log.drain(..100);
         }
@@ -257,10 +264,11 @@ impl App {
     ///
     /// 最大化/全屏/最小化时**不改几何**（沿用 `prev`）：否则会把"最大化后的尺寸"当成
     /// 普通窗口尺寸存下来，下次启动就变成一个占满屏、不能还原的怪窗口。
-    fn current_settings(ctx: &egui::Context, prev: &Settings) -> Settings {
+    fn current_settings(ctx: &egui::Context, prev: &Settings, lang: Lang) -> Settings {
         let mut st = Settings {
             zoom: ctx.zoom_factor(),
             rect: prev.rect,
+            lang,
         };
         if let Some(r) = Self::observed_rect(ctx) {
             st.rect = Some(r);
@@ -286,7 +294,7 @@ impl App {
 
     /// 立刻落盘（缩放菜单点选、关窗时用）。
     fn save_settings_now(&mut self, ctx: &egui::Context) {
-        let st = Self::current_settings(ctx, &self.pending);
+        let st = Self::current_settings(ctx, &self.pending, self.lang);
         st.save();
         self.saved = st;
         self.pending = st;
@@ -296,7 +304,7 @@ impl App {
     /// 每帧调用：值**稳定 600 ms** 后自动落盘。
     /// 拖动窗口 / Ctrl+滚轮时每秒会变几十次，不去抖就会疯狂写文件。
     fn autosave_settings(&mut self, ctx: &egui::Context) {
-        let cur = Self::current_settings(ctx, &self.pending);
+        let cur = Self::current_settings(ctx, &self.pending, self.lang);
         self.zoom = cur.zoom;              // 让"当前 xx%"跟随 Ctrl+滚轮
 
         if cur != self.pending {
@@ -319,7 +327,7 @@ impl App {
             return;
         }
         self.scanning = true;
-        self.push_log("扫描 RA6E2 候选串口（按 VID:PID 045B:0263，不认 COM 号）...".into());
+        self.push_log(LogMsg::ScanStart);
 
         let (tx, rx) = channel();
         self.scan_rx = Some(rx);
@@ -328,45 +336,42 @@ impl App {
             let t0 = Instant::now();
             let list = board::scan();
             for b in &list {
-                let _ = log.send(format!(
-                    "发现 {} → {}（固件 {}）",
-                    b.port,
-                    b.id.clone().unwrap_or_else(|| "无 $ID 应答".into()),
-                    b.fw.map(|v| format!("v{v}")).unwrap_or_else(|| "无".into())
-                ));
+                let _ = log.send(LogMsg::ScanFound {
+                    port: b.port.clone(),
+                    id: b.id.clone().unwrap_or_else(|| "无 $ID 应答".into()),
+                    fw: b
+                        .fw
+                        .map(|v| format!("v{v}"))
+                        .unwrap_or_else(|| "无".into()),
+                });
             }
             if list.is_empty() {
-                let _ = log.send("没有找到 045B:0263 的设备（板子没插 / 没跑固件）".into());
+                let _ = log.send(LogMsg::ScanNone);
             }
-            let _ = log.send(format!(
-                "扫描完成：{} 块，耗时 {} ms（缓存命中时只需一次 $ID? 往返）",
-                list.len(),
-                t0.elapsed().as_millis()
-            ));
+            let _ = log.send(LogMsg::ScanDone {
+                n: list.len(),
+                ms: t0.elapsed().as_millis(),
+            });
             let _ = tx.send(list);
         });
     }
 
     fn start_connect(&mut self) {
         let Some(b) = self.boards.get(self.selected).cloned() else {
-            self.push_log("没有可连接的板子，先点「扫描板子」".into());
+            self.push_log(LogMsg::NoBoardToConnect);
             return;
         };
 
         if !b.online {
-            self.push_log(format!(
-                "{} 当前不在线（来自缓存）。插上 Type-C 后重新扫描再连接。",
-                b.port
-            ));
+            self.push_log(LogMsg::BoardOffline(b.port.clone()));
             return;
         }
 
         self.running = true;
-        self.push_log(format!(
-            "开始连接 {}（ID {}）...",
-            b.port,
-            b.id.clone().unwrap_or_else(|| "未识别".into())
-        ));
+        self.push_log(LogMsg::ConnectStart {
+            port: b.port.clone(),
+            id: b.id.clone().unwrap_or_else(|| "未识别".into()),
+        });
 
         // 只登记"要发到哪个串口"，真正的开关串口由常驻监控线程做
         if let Ok(mut sh) = self.shared.lock() {
@@ -381,7 +386,7 @@ impl App {
             s.want_port = None;          // 监控线程看到 None 就会关串口
             s.link_up = false;
         }
-        self.push_log("已断开（采样继续，只是不再发帧）".into());
+        self.push_log(LogMsg::Disconnected);
     }
 }
 
@@ -389,21 +394,21 @@ impl App {
 
 /// 常驻监控线程：**始终采样**（未连接板子也有读数），并按 `shared.want_port`
 /// 自动开关串口、发帧。这样"打开程序就有数据"，不必先连板子。
-fn monitor(shared: Arc<Mutex<Shared>>, mask: Arc<Mutex<Mask>>, log: Sender<String>) {
-    let say = |m: String| {
+fn monitor(shared: Arc<Mutex<Shared>>, mask: Arc<Mutex<Mask>>, log: Sender<LogMsg>) {
+    let say = |m: LogMsg| {
         let _ = log.send(m);
     };
 
     // LHM 没跑就没有温度/风扇（它要读 MSR/SuperIO 内核驱动）
     match crate::lhm::ensure_running() {
-        Ok(()) => say("LHM 已就绪（未连接板子也会采样）".into()),
-        Err(e) => say(format!("LHM 不可用: {e}（温度/风扇会缺失）")),
+        Ok(()) => say(LogMsg::LhmReady),
+        Err(e) => say(LogMsg::LhmUnavailable(e.to_string())),
     }
 
     let mut cpu = CpuUsage::new();
     let mut gpu = GpuUsage::new();
     if gpu.is_none() {
-        say("PDH 的 GPU Engine 计数器不可用，GPU 使用率将缺失".into());
+        say(LogMsg::PdhGpuUnavailable);
     }
 
     // Phase 4：枚举适配器写进 Shared 供 UI 下拉（按显存降序，index 0 = 主卡）；
@@ -462,7 +467,7 @@ fn monitor(shared: Arc<Mutex<Shared>>, mask: Arc<Mutex<Mask>>, log: Sender<Strin
             if let Some((p, ser)) = open.take() {
                 // 句柄放回槽里复用，**不关闭**（关闭会拉低 DTR ⇒ 主机侧 30 s 才认回）
                 board::release(&p, ser);
-                say(format!("关闭串口 {p}"));
+                say(LogMsg::SerialClosed(p));
             }
             if let Ok(mut sh) = shared.lock() {
                 sh.link_up = false;
@@ -470,7 +475,7 @@ fn monitor(shared: Arc<Mutex<Shared>>, mask: Arc<Mutex<Mask>>, log: Sender<Strin
             if let Some(w) = want.clone() {
                 match board::acquire(&w) {
                     Ok(ser) => {
-                        say(format!("串口已打开 {w}（未设置 DTR/RTS）"));
+                        say(LogMsg::SerialOpened(w.clone()));
                         open = Some((w, ser));
                         if let Ok(mut sh) = shared.lock() {
                             sh.started = Some(Instant::now());
@@ -480,7 +485,7 @@ fn monitor(shared: Arc<Mutex<Shared>>, mask: Arc<Mutex<Mask>>, log: Sender<Strin
                         }
                     }
                     Err(e) => {
-                        say(format!("打开串口失败: {e}（采样继续）"));
+                        say(LogMsg::SerialOpenErr(e.to_string()));
                         if let Ok(mut sh) = shared.lock() {
                             sh.want_port = None;   // 让 UI 的「连接」按钮回到未连接态
                         }
@@ -499,14 +504,14 @@ fn monitor(shared: Arc<Mutex<Shared>>, mask: Arc<Mutex<Mask>>, log: Sender<Strin
                 let mut ok = true;
                 if let Err(e) = ser.write_all(&f) {
                     ok = false;
-                    say(format!("写失败: {e}"));
+                    say(LogMsg::WriteFailed(e.to_string()));
                     // 设备可能刚被重新枚举（拔插 Type-C / 复位 / 重烧固件）
                     if !ser.alive() {
-                        say("句柄已失效（设备重新枚举过）→ 重新打开串口".into());
+                        say(LogMsg::HandleStale);
                         match board::acquire(port) {
                             Ok(s2) => *ser = s2,
                             Err(ee) => {
-                                say(format!("重开串口失败: {ee}"));
+                                say(LogMsg::ReopenFailed(ee.to_string()));
                                 need_drop = true;
                             }
                         }
@@ -689,9 +694,10 @@ fn settings_path() -> std::path::PathBuf {
 
 /// 会持久化到 `%LOCALAPPDATA%\Ra6e2Monitor\ui.json` 的用户界面偏好。
 ///
-/// 记住两样东西：
+/// 记住三样东西：
 ///   · `zoom`   —— 界面缩放（缩放菜单、Ctrl+滚轮都算）；
-///   · `window` —— 窗口内尺寸（点/逻辑像素），`main.rs` 建窗口时读取。
+///   · `rect`   —— 窗口外框矩形（物理像素），`main.rs` 建窗口时读取；
+///   · `lang`   —— 界面语言（默认中文）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
     pub zoom: f32,
@@ -700,11 +706,17 @@ pub struct Settings {
     /// ⚠ 必须是物理像素（Win32 `GetWindowRect`）：egui 的 rects 是"缩放后的点"，
     /// 用它存再还原会被 zoom 多除一次，窗口位置/大小必错（2026-10-25 实测）。
     pub rect: Option<(i32, i32, i32, i32)>,
+    /// 界面语言。默认中文；顶栏按钮切换后落盘。
+    pub lang: Lang,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { zoom: 1.0, rect: None }
+        Self {
+            zoom: 1.0,
+            rect: None,
+            lang: Lang::Zh,
+        }
     }
 }
 
@@ -739,6 +751,9 @@ impl Settings {
                 }
             }
         }
+        if let Some(l) = v.get("lang").and_then(|x| x.as_u64()) {
+            out.lang = Lang::from_u8(l as u8);
+        }
         out
     }
 
@@ -747,9 +762,13 @@ impl Settings {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let mut text = format!("{{\"zoom\":{}", self.zoom);
+        // 手工拼 JSON：先开对象、写 zoom/lang，再按需追加 rect，最后统一收尾大括号。
+        // （不能让初始 format! 提前闭合大括号，否则 rect 段会写出非法 JSON。）
+        let mut text = String::from("{");
+        text.push_str(&format!("\"zoom\":{},", self.zoom));
+        text.push_str(&format!("\"lang\":{}", self.lang.to_u8()));
         if let Some((l, t, r, b)) = self.rect {
-            text.push_str(&format!(",\"rect\":[{l},{t},{r},{b}]"));
+            text.push_str(&format!(", \"rect\":[{l}, {t}, {r}, {b}]"));
         }
         text.push('}');
         // 原子写：先写临时文件再替换。直接 fs::write 半路断电会留下被截断的 JSON
@@ -791,7 +810,7 @@ impl eframe::App for App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     if self.hidden_to_tray {
                         self.hidden_to_tray = false;
-                        self.push_log("已从托盘恢复窗口".into());
+                        self.push_log(LogMsg::RestoredFromTray);
                     }
                 }
                 crate::tray::TrayEvent::Quit => {
@@ -814,7 +833,7 @@ impl eframe::App for App {
             self.rect_applied = true;
             if let Some((l, t, r, b)) = self.saved.rect {
                 if crate::tray::place_main_window(l, t, r - l, b - t) {
-                    self.push_log("已恢复窗口位置/尺寸（首帧补做）".into());
+                    self.push_log(LogMsg::WindowRestoredFirstFrame);
                 }
             }
         }
@@ -833,11 +852,10 @@ impl eframe::App for App {
                 if z > max_zoom + 1e-3 {
                     ctx.set_zoom_factor(max_zoom);
                     self.zoom = max_zoom;
-                    self.push_log(format!(
-                        "本机屏幕放不下 {:.0}% 缩放，已限制为 {:.0}%",
-                        z * 100.0,
-                        max_zoom * 100.0
-                    ));
+                    self.push_log(LogMsg::ZoomClamped {
+                        want: (z * 100.0) as u32,
+                        got: (max_zoom * 100.0) as u32,
+                    });
                 }
             }
         }
@@ -871,7 +889,7 @@ impl eframe::App for App {
         // 免得一直卡在「连接中...」。
         if self.running && !link_up && want_port.is_none() {
             self.running = false;
-            self.push_log("串口未能打开，已回到未连接状态（采样继续）".into());
+            self.push_log(LogMsg::SerialOpenFailedBack);
         }
 
         self.top_bar(ui, link_up, rate);
@@ -919,15 +937,14 @@ impl App {
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let (dot, txt) = if self.running && link_up {
-                    (egui::Color32::from_rgb(76, 175, 80), format!("已连接 · {:.1} Hz", rate))
-                } else if self.running {
-                    (egui::Color32::from_rgb(255, 193, 7), "连接中...".to_string())
-                } else if self.scanning {
-                    (egui::Color32::from_rgb(255, 193, 7), "扫描中...".to_string())
+                let dot = if self.running && link_up {
+                    egui::Color32::from_rgb(76, 175, 80)
+                } else if self.running || self.scanning {
+                    egui::Color32::from_rgb(255, 193, 7)
                 } else {
-                    (egui::Color32::from_rgb(140, 140, 140), "未连接".to_string())
+                    egui::Color32::from_rgb(140, 140, 140)
                 };
+                let txt = status_text(self.running, link_up, self.scanning, rate, self.lang);
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
                 ui.painter().circle_filled(rect.center(), 4.5, dot);
 
@@ -935,25 +952,25 @@ impl App {
                     if ui
                         .add_enabled(
                             !self.hidden_to_tray,
-                            egui::Button::new(egui::RichText::new("收进托盘").size(11.0)),
+                            egui::Button::new(egui::RichText::new(T::ToTray.t(self.lang)).size(11.0)),
                         )
-                        .on_hover_text("隐藏到系统托盘（采样与发帧继续）。双击托盘图标可恢复")
+                        .on_hover_text(T::TrayHover.t(self.lang))
                         .clicked()
                     {
                         self.hidden_to_tray = true;
-                        self.push_log("已收进系统托盘（采样与发帧继续）".into());
+                        self.push_log(LogMsg::ToTray);
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
                     }
                     ui.add_space(6.0);
                 }
 
-                ui.label(egui::RichText::new("RA6E2 系统监控台").size(14.0).strong());
+                ui.label(egui::RichText::new(T::Title.t(self.lang)).size(14.0).strong());
                 ui.label(egui::RichText::new("v1.0.0").size(11.0).weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // right_to_left 布局：先加的在上层（最右），所以"设置"在最右边
-                    ui.menu_button("设置", |ui| {
+                    ui.menu_button(T::Settings.t(self.lang), |ui| {
                         ui.set_min_width(190.0);
-                        ui.label(egui::RichText::new("界面字体大小").size(11.0).weak());
+                        ui.label(egui::RichText::new(T::FontSize.t(self.lang)).size(11.0).weak());
                         ui.add_space(4.0);
 
                         for (label, z) in [
@@ -979,6 +996,15 @@ impl App {
                                 .weak(),
                         );
                     });
+                    // 中英切换按钮：显示「将要切换到的语言」，点一下翻转并 600ms 后落盘
+                    if ui
+                        .button(egui::RichText::new(self.lang.switch_label()).size(12.0))
+                        .clicked()
+                    {
+                        self.lang = self.lang.toggle();
+                        self.pending.lang = self.lang;
+                        self.last_change = Some(Instant::now());
+                    }
                     ui.label(egui::RichText::new(txt).size(12.0).color(dot));
                 });
             });
@@ -988,7 +1014,7 @@ impl App {
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
-        ui.label(egui::RichText::new("板子识别").size(11.0).weak());
+        ui.label(egui::RichText::new(T::BoardHeader.t(self.lang)).size(11.0).weak());
         ui.add_space(4.0);
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1002,25 +1028,25 @@ impl App {
                     );
                     ui.add_space(3.0);
                     egui::Grid::new("board_grid").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
-                        ui.label(egui::RichText::new("端口").size(11.0).weak());
+                        ui.label(egui::RichText::new(T::Port.t(self.lang)).size(11.0).weak());
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(&b.port).size(11.0).monospace());
                             if !b.online {
                                 ui.label(
-                                    egui::RichText::new("未插")
+                                    egui::RichText::new(T::Offline.t(self.lang))
                                         .size(10.0)
                                         .color(egui::Color32::from_rgb(230, 110, 110)),
                                 );
                             } else if b.cached {
                                 ui.label(
-                                    egui::RichText::new("缓存")
+                                    egui::RichText::new(T::Cached.t(self.lang))
                                         .size(10.0)
                                         .color(egui::Color32::from_rgb(150, 170, 200)),
                                 );
                             }
                         });
                         ui.end_row();
-                        ui.label(egui::RichText::new("固件").size(11.0).weak());
+                        ui.label(egui::RichText::new(T::Firmware.t(self.lang)).size(11.0).weak());
                         ui.label(
                             egui::RichText::new(match b.fw {
                                 Some(v) => format!("v{v}"),
@@ -1030,7 +1056,7 @@ impl App {
                             .monospace(),
                         );
                         ui.end_row();
-                        ui.label(egui::RichText::new("UID").size(11.0).weak());
+                        ui.label(egui::RichText::new(T::Uid.t(self.lang)).size(11.0).weak());
                         ui.label(
                             egui::RichText::new(b.id.clone().unwrap_or_else(|| "—".into()))
                                 .size(11.0)
@@ -1040,8 +1066,8 @@ impl App {
                     });
                 }
                 None => {
-                    ui.label(egui::RichText::new("未发现板子").size(12.0));
-                    ui.label(egui::RichText::new("插上 Type-C 后点「扫描板子」").size(11.0).weak());
+                    ui.label(egui::RichText::new(T::NoBoard.t(self.lang)).size(12.0));
+                    ui.label(egui::RichText::new(T::NoBoardHint.t(self.lang)).size(11.0).weak());
                 }
             }
         });
@@ -1066,7 +1092,7 @@ impl App {
 
         let can_scan = !self.scanning && !self.running;
         if ui
-            .add_enabled(can_scan, egui::Button::new("扫描板子").min_size(egui::vec2(ui.available_width(), 26.0)))
+            .add_enabled(can_scan, egui::Button::new(T::ScanBoards.t(self.lang)).min_size(egui::vec2(ui.available_width(), 26.0)))
             .clicked()
         {
             self.start_scan();
@@ -1083,7 +1109,7 @@ impl App {
                             .get(self.selected)
                             .map(|b| b.online)
                             .unwrap_or(false),
-                    egui::Button::new(egui::RichText::new("开始连接").color(egui::Color32::from_rgb(96, 200, 120)))
+                    egui::Button::new(egui::RichText::new(T::Connect.t(self.lang)).color(egui::Color32::from_rgb(96, 200, 120)))
                         .min_size(egui::vec2(w, 28.0)),
                 )
                 .clicked()
@@ -1093,7 +1119,7 @@ impl App {
             if ui
                 .add_enabled(
                     self.running,
-                    egui::Button::new("断开").min_size(egui::vec2(w, 28.0)),
+                    egui::Button::new(T::Disconnect.t(self.lang)).min_size(egui::vec2(w, 28.0)),
                 )
                 .clicked()
             {
@@ -1102,7 +1128,7 @@ impl App {
         });
 
         ui.add_space(10.0);
-        ui.label(egui::RichText::new("日志").size(11.0).weak());
+        ui.label(egui::RichText::new(T::LogHeader.t(self.lang)).size(11.0).weak());
         ui.add_space(3.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1110,8 +1136,13 @@ impl App {
                 .stick_to_bottom(true)
                 .max_height(150.0)
                 .show(ui, |ui| {
-                    for line in &self.log {
-                        ui.label(egui::RichText::new(line).size(11.0).monospace().weak());
+                    for (ts, m) in &self.log {
+                        ui.label(
+                            egui::RichText::new(format!("{ts} {}", m.text(self.lang)))
+                                .size(11.0)
+                                .monospace()
+                                .weak(),
+                        );
                     }
                 });
         });
@@ -1127,7 +1158,7 @@ impl App {
         rate: f32,
     ) {
         ui.add_space(6.0);
-        ui.label(egui::RichText::new("发送数据项").size(11.0).weak());
+        ui.label(egui::RichText::new(T::Telemetry.t(self.lang)).size(11.0).weak());
         ui.add_space(5.0);
 
         let fmt = |v: Option<i32>, unit: &str| match v {
@@ -1137,18 +1168,18 @@ impl App {
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.checkbox(&mut self.mask.cpu_group, egui::RichText::new("CPU").size(12.0).strong());
+            ui.checkbox(&mut self.mask.cpu_group, egui::RichText::new(T::Cpu.t(self.lang)).size(12.0).strong());
             ui.add_space(4.0);
             // bottom_row：底对齐 + 可换行（窗口窄或 zoom 调大时自动换行）
             bottom_row(ui, |ui| {
                 ui.add_enabled_ui(self.mask.cpu_group, |ui| {
-                    ui.checkbox(&mut self.mask.cpu_temp, "温度");
+                    ui.checkbox(&mut self.mask.cpu_temp, T::Temp.t(self.lang));
                     ui.label(egui::RichText::new(fmt(sample.ct, "°C")).size(11.0).monospace().color(READOUT_GREEN));
                     ui.add_space(10.0);
-                    ui.checkbox(&mut self.mask.cpu_load, "占用");
+                    ui.checkbox(&mut self.mask.cpu_load, T::Load.t(self.lang));
                     ui.label(egui::RichText::new(fmt(sample.cu, "%")).size(11.0).monospace().color(READOUT_GREEN));
                     ui.add_space(10.0);
-                    ui.checkbox(&mut self.mask.cpu_fan, "风扇");
+                    ui.checkbox(&mut self.mask.cpu_fan, T::Fan.t(self.lang));
                     ui.label(egui::RichText::new(fmt(sample.cf_display, sample.cf_unit.suffix())).size(11.0).monospace().color(READOUT_GREEN));
                 });
             });
@@ -1157,20 +1188,20 @@ impl App {
         ui.add_space(6.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.checkbox(&mut self.mask.gpu_group, egui::RichText::new("GPU").size(12.0).strong());
+            ui.checkbox(&mut self.mask.gpu_group, egui::RichText::new(T::Gpu.t(self.lang)).size(12.0).strong());
             ui.add_space(4.0);
             bottom_row(ui, |ui| {
                 ui.add_enabled_ui(self.mask.gpu_group, |ui| {
-                    ui.checkbox(&mut self.mask.gpu_temp, "温度");
+                    ui.checkbox(&mut self.mask.gpu_temp, T::Temp.t(self.lang));
                     ui.label(egui::RichText::new(fmt(sample.gt, "°C")).size(11.0).monospace().color(READOUT_GREEN));
                     ui.add_space(10.0);
-                    ui.checkbox(&mut self.mask.gpu_load, "占用");
+                    ui.checkbox(&mut self.mask.gpu_load, T::Load.t(self.lang));
                     ui.label(egui::RichText::new(fmt(sample.gu, "%")).size(11.0).monospace().color(READOUT_GREEN));
                     ui.add_space(10.0);
-                    ui.checkbox(&mut self.mask.gpu_fan, "风扇");
+                    ui.checkbox(&mut self.mask.gpu_fan, T::Fan.t(self.lang));
                     ui.label(egui::RichText::new(fmt(sample.gf_display, sample.gf_unit.suffix())).size(11.0).monospace().color(READOUT_GREEN));
                     ui.add_space(10.0);
-                    ui.checkbox(&mut self.mask.gpu_vram, "显存");
+                    ui.checkbox(&mut self.mask.gpu_vram, T::Vram.t(self.lang));
                     ui.label(egui::RichText::new(fmt(sample.gv, "%")).size(11.0).monospace().color(READOUT_GREEN));
                 });
             });
@@ -1193,7 +1224,7 @@ impl App {
                 let mut sel = sel.min(names.len().saturating_sub(1));
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("选卡:").size(11.0).weak());
+                    ui.label(egui::RichText::new(T::GpuSelect.t(self.lang)).size(11.0).weak());
                     egui::ComboBox::from_label("")
                         .selected_text(names[sel].as_str())
                         .show_index(ui, &mut sel, names.len(), |i| names[i].clone());
@@ -1202,7 +1233,7 @@ impl App {
                     s.gpu_selection = sel;
                 }
                 ui.label(
-                    egui::RichText::new(format!("数据来源: {}", src.label()))
+                    egui::RichText::new(format!("{}: {}", T::Source.t(self.lang), src.label()))
                         .size(11.0)
                         .weak(),
                 );
@@ -1214,19 +1245,19 @@ impl App {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             bottom_row(ui, |ui| {
-                ui.checkbox(&mut self.mask.mem, egui::RichText::new("内存").size(12.0).strong());
+                ui.checkbox(&mut self.mask.mem, egui::RichText::new(T::Memory.t(self.lang)).size(12.0).strong());
                 // 间距由 item_spacing.x 提供，别再叠加 add_space（会变成 16px）
                 ui.label(egui::RichText::new(fmt(sample.mu, "%")).size(11.0).monospace().color(READOUT_GREEN));
             });
         });
 
         ui.add_space(10.0);
-        ui.label(egui::RichText::new("实时帧").size(11.0).weak());
+        ui.label(egui::RichText::new(T::LiveFrame.t(self.lang)).size(11.0).weak());
         ui.add_space(3.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             let text = if last_frame.is_empty() {
-                "（尚未发送）"
+                T::NotSent.t(self.lang)
             } else {
                 last_frame
             };
@@ -1240,11 +1271,11 @@ impl App {
         //   三张卡累计比可用宽度多出 ~32px ⇒ 最后一张（写超时）被推出窗口外。
         //   columns 由 egui 自己按可用宽度均分并扣掉间距，不会再溢出。
         ui.columns(3, |cols| {
-            metric(&mut cols[0], "已发送", &sent.to_string(), None);
-            metric(&mut cols[1], "实际帧率", &format!("{rate:.1}"), None);
+            metric(&mut cols[0], T::Sent.t(self.lang), &sent.to_string(), None);
+            metric(&mut cols[1], T::Fps.t(self.lang), &format!("{rate:.1}"), None);
             metric(
                 &mut cols[2],
-                "写超时",
+                T::Timeouts.t(self.lang),
                 &errors.to_string(),
                 Some(if errors == 0 {
                     egui::Color32::from_rgb(96, 200, 120)
@@ -1307,6 +1338,7 @@ mod settings_tests {
         let want = Settings {
             zoom: 1.25,
             rect: Some((240, 120, 1520, 840)),   // 物理像素外框：1280×720 @ (240,120)
+            lang: Lang::Zh,
         };
         want.save();
         assert_eq!(Settings::load(), want, "写进去的缩放/窗口大小要能原样读回");
