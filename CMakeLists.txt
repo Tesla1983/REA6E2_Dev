@@ -29,7 +29,11 @@ set(APP_DIR  "${CMAKE_CURRENT_SOURCE_DIR}/src")
 # probe-rs 配置: 目标芯片 + 本项目专用探针
 set(RA_CHIP      "R7FA6E2BB" CACHE STRING "probe-rs 目标芯片(256KB flash 变体)")
 set(RA_PROBE_SEL "0d28:0204" CACHE STRING "本项目 DAPLink; FireDAP(0416:5021) 属 STM32H743, 禁止使用")
-find_program(PROBE_RS NAMES probe-rs probe-rs.exe REQUIRED)
+# 烧录/校验目标才需要 probe-rs; 仅编译固件(如 CI)时不必安装, 故不设 REQUIRED。
+find_program(PROBE_RS NAMES probe-rs probe-rs.exe)
+if(NOT PROBE_RS)
+    message(STATUS "probe-rs 未找到: flash/verify/probe/gdbserver 目标将不可用(不影响编译固件)")
+endif()
 
 # 内存占用报告(scripts/size_report.py)需要 Python, 仅用标准库
 find_program(PYTHON_EXE NAMES python3 python REQUIRED)
@@ -100,8 +104,6 @@ target_include_directories(${PROJECT_NAME}.elf PRIVATE
 # 编译选项 (照抄 e²studio Debug 配置)
 # ------------------------------------------------------------
 target_compile_options(${PROJECT_NAME}.elf PRIVATE
-    -Og                        # 调试友好; 发版可改 -O2 / -Os
-    -g3
     -fmessage-length=0
     -fsigned-char
     -ffunction-sections
@@ -112,6 +114,16 @@ target_compile_options(${PROJECT_NAME}.elf PRIVATE
     -Wpointer-arith -Wshadow -Wlogical-op -Wfloat-equal
     -Wmissing-declarations
 )
+
+# 优化级别随构建类型: Release 用 -O2 并关闭断言, 其余(含未指定 BUILD_TYPE)保持调试友好。
+# CI 发版走 -DCMAKE_BUILD_TYPE=Release, 本地默认沿用 -Og -g3(便于调试)。
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_compile_options(${PROJECT_NAME}.elf PRIVATE -O2 -DNDEBUG)
+    message(STATUS "优化级别: Release (-O2 -DNDEBUG)")
+else()
+    target_compile_options(${PROJECT_NAME}.elf PRIVATE -Og -g3)
+    message(STATUS "优化级别: Debug (-Og -g3)")
+endif()
 
 # ------------------------------------------------------------
 # 链接选项
@@ -175,11 +187,13 @@ add_custom_target(size
     COMMENT "查看 Flash/RAM 占用"
 )
 
+if(PROBE_RS)
 add_custom_target(probe
     COMMAND ${PROBE_RS} info --chip ${RA_CHIP} --probe ${RA_PROBE_SEL}
     COMMENT "DAPLink 连通性自检"
     VERBATIM
 )
+endif()
 
 # ------------------------------------------------------------
 # option-setting 段烧录策略(重要)
@@ -208,6 +222,7 @@ endforeach()
 
 # 烧录: 会擦除片上现有程序, 需手动显式调用
 # 注意: download 的 --verify 是下载后顺带校验, 与独立的 verify 子命令不是一回事
+if(PROBE_RS)
 add_custom_target(flash
     COMMAND ${PROBE_RS} download --chip ${RA_CHIP} --probe ${RA_PROBE_SEL}
             ${RA_SKIP_ARGS}
@@ -234,6 +249,7 @@ add_custom_target(gdbserver
     COMMENT "启动 GDB 服务器 :1337 (不烧录)"
     VERBATIM
 )
+endif()
 
 message(STATUS "-------------------------------------------")
 message(STATUS " 芯片    : ${RA_CHIP}  (Cortex-M33, 256KB flash / 40KB SRAM)")

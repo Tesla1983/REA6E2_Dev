@@ -25,8 +25,13 @@ endif()
 
 # 内存占用报告: ESP-IDF 风格表格(详见 scripts/size_report.py)
 # objdump 与 objcopy 在同一个工具链 bin 目录里, 直接推导, 不用再传一个参数
+# ⚠ Windows 下后缀是 .exe, Linux/macOS 没有后缀 —— 平台自适应(否则 CI Linux runner 找不到)。
 get_filename_component(TOOLBIN_DIR "${OBJCOPY}" DIRECTORY)
-set(OBJDUMP "${TOOLBIN_DIR}/arm-none-eabi-objdump.exe")
+if(WIN32)
+    set(OBJDUMP "${TOOLBIN_DIR}/arm-none-eabi-objdump.exe")
+else()
+    set(OBJDUMP "${TOOLBIN_DIR}/arm-none-eabi-objdump")
+endif()
 if(NOT EXISTS "${OBJDUMP}")
     message(FATAL_ERROR "找不到 objdump: ${OBJDUMP}")
 endif()

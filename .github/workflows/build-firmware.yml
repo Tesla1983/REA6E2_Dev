@@ -1,0 +1,124 @@
+# ============================================================
+# RA6E2 固件 CI/CD
+# ------------------------------------------------------------
+# 触发:
+#   - 推送到 main / 任意 PR             → 编译验证 + 上传构建产物(artifact)
+#   - 推送版本标签 v*.*.*               → 编译 + 创建 GitHub Release 并上传固件(公开可下载)
+#
+# 产物(均在 build/ 下, 由 cmake/PostBuild.cmake 生成):
+#   ra6e2_fw.elf / .hex / .bin / .srec / .map
+# 其中 .bin 是给烧录工具/上位机用的裸镜像; .hex 方便多数编程器; .elf 含调试符号。
+#
+# 工具链: GitHub Ubuntu runner 自带 apt 源安装 gcc-arm-none-eabi(含 newlib-nano),
+#         无需外链下载。版本与本地 14.3 rel1 略有差异但对本固件无功能影响;
+#         若需严格版本对齐, 可改用 xpack / arm-none-eabi-gcc-action 并固定版本。
+# ============================================================
+
+name: Build RA6E2 Firmware
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write   # 创建 Release + 上传资产所需
+
+jobs:
+  build:
+    name: Build firmware (${{ matrix.build-type }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build-type: [Release, Debug]   # Release=发版优化产物; Debug=调试配置回归
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain (arm-none-eabi-gcc + ninja)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi ninja-build
+          arm-none-eabi-gcc --version | head -1
+
+      - name: Configure (CMake + Ninja)
+        run: cmake -G Ninja -B build \
+                -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-ra6e2.cmake \
+                -DCMAKE_BUILD_TYPE=${{ matrix.build-type }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Show firmware size
+        run: cmake --build build -t size || true
+
+      - name: List build artifacts
+        run: ls -la build/ra6e2_fw.*
+
+      # ---- 每次构建都上传产物(artifact), 便于 PR / 分支预览下载 ----
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ra6e2-firmware-${{ matrix.build-type }}
+          path: |
+            build/ra6e2_fw.elf
+            build/ra6e2_fw.hex
+            build/ra6e2_fw.bin
+            build/ra6e2_fw.srec
+            build/ra6e2_fw.map
+          if-no-files-found: error
+          retention-days: 90
+
+  release:
+    name: Publish firmware release
+    # 仅当推送版本标签(v*)时发布; 直接取 build 矩阵里 Release 产物作为公开下载固件
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ra6e2-firmware-Release
+          path: build
+
+      - name: List downloaded artifacts
+        run: ls -la build/ra6e2_fw.*
+
+      - name: Draft release notes
+        run: |
+          {
+            echo "## RA6E2 固件构建信息"
+            echo ""
+            echo "- 提交: \`${{ github.sha }}\`"
+            echo "- 标签: \`${{ github.ref_name }}\`"
+            echo "- 目标: Renesas RA6E2 (R7FA6E2BB, Cortex-M33, 256KB Flash / 40KB SRAM)"
+            echo "- 构建类型: Release (-O2)"
+            echo ""
+            echo "### 下载"
+            echo "- \`ra6e2_fw.bin\` —— 裸镜像, 烧录工具/上位机直接用"
+            echo "- \`ra6e2_fw.hex\` —— Intel HEX, 通用编程器"
+            echo "- \`ra6e2_fw.elf\` —— 含调试符号"
+            echo "- \`ra6e2_fw.map\` / \`ra6e2_fw.srec\` —— 链接映射 / Motorola S-record"
+          } > release_notes.md
+          cat release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/ra6e2_fw.elf
+            build/ra6e2_fw.hex
+            build/ra6e2_fw.bin
+            build/ra6e2_fw.srec
+            build/ra6e2_fw.map
+          body_path: release_notes.md
+          generate_release_notes: true
+          make_latest: true
