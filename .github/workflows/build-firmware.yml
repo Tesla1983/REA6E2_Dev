@@ -27,12 +27,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 固定版本的工具链(自带 newlib + binutils)，避免 apt 版本漂移 / 分裂包缺失，
-      # 也与本地 14.3 同代，不会触发 GCC 15 把兼容指针类型等默认升为错误。
-      - name: Install ARM GCC toolchain (pinned 14.2.rel1)
+      # 固定版本的工具链(自带 newlib + binutils)，且与本地 14.3 rel1 完全一致，
+      # 避免 apt 版本漂移 / 分裂包缺失，也规避 GCC 15 把兼容指针类型等默认升为错误。
+      # 注意：carlosperate 动作版本字符串用大写 R（如 14.3.Rel1）。
+      - name: Install ARM GCC toolchain (pinned 14.3.Rel1)
         uses: carlosperate/arm-none-eabi-gcc-action@v1
         with:
-          release: '14.2.rel1'
+          release: '14.3.Rel1'
 
       - name: Install Ninja
         run: |
