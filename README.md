@@ -1,3 +1,5 @@
+<img width="2149" height="2244" alt="Image" src="https://github.com/user-attachments/assets/cb66d0a3-4453-4c2b-9c3a-f4bc3ac0a7cc" />
+
 > 其它语言：[English](README_EN.md)
 
 # RA6E2 系统监控屏
