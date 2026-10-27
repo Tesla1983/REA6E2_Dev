@@ -1,0 +1,57 @@
+{
+  "_note": "从网上实测评测提取的 NVIDIA / AMD 显卡物理样本数据，用于虚拟后端测试。值代表 gaming/load 场景（非待机）。来源见各卡 _source。",
+  "scenario": "gaming/load",
+  "cards": [
+    {
+      "_source": "本机 Intel Arc A770（充当多卡主机里的 Intel 卡，LHM+PDH 路径），实测见 live_lhm_sanity",
+      "vendor": "Intel",
+      "name": "Intel(R) Arc(TM) A770 Graphics",
+      "bdf": "00:01.0",
+      "luid": [4369, 8738],
+      "index": 0,
+      "vram_mb": 8192,
+      "software": false,
+      "lhmpdh_only": true,
+      "temp_c": 53,
+      "util_pct": 12,
+      "fan_rpm": 800,
+      "power_w": 35,
+      "mem_used_mb": 1024,
+      "mem_total_mb": 8192
+    },
+    {
+      "_source": "NVIDIA RTX 4070 实测：待机 ~38-42C/17-21W/风扇0%；满载(FurMark/3DMark) ~61-65C/200-212W(峰值247W)/~1430RPM(46%)/利用率98-100%。显存 12GB GDDR6X。来源：coolaler MSI Gaming X Trio 开箱、toutiao iGame Vulcan OC 评测、positioniseverything 综述",
+      "vendor": "NVIDIA",
+      "name": "NVIDIA GeForce RTX 4070",
+      "bdf": "01:00.0",
+      "luid": [13107, 17476],
+      "index": 1,
+      "vram_mb": 12288,
+      "software": false,
+      "lhmpdh_only": false,
+      "temp_c": 64,
+      "util_pct": 98,
+      "fan_rpm": 1430,
+      "power_w": 200,
+      "mem_used_mb": 4096,
+      "mem_total_mb": 12288
+    },
+    {
+      "_source": "AMD RX 7800 XT 实测：待机 ~34C/9.5-12.5W/风扇0%；满载 ~70C/245-257W(峰值~294W)/~1308-1315RPM(35-46%)/利用率~99%。显存 16GB GDDR6。来源：expreview 盈通/撼讯评测、prosncons PowerColor 综述、swifttechy 规格",
+      "vendor": "AMD",
+      "name": "AMD Radeon RX 7800 XT",
+      "bdf": "02:00.0",
+      "luid": [21845, 26214],
+      "index": 2,
+      "vram_mb": 16384,
+      "software": false,
+      "lhmpdh_only": false,
+      "temp_c": 70,
+      "util_pct": 99,
+      "fan_rpm": 1315,
+      "power_w": 250,
+      "mem_used_mb": 6144,
+      "mem_total_mb": 16384
+    }
+  ]
+}

@@ -10,6 +10,7 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use serde_json::Value;
+use crate::gpu::Source;
 
 /// LHM 的 Web Server 地址（端口与 LHM 配置里的 listenerPort 一致）。
 pub const LHM_URL: &str = "127.0.0.1:8085";
@@ -31,6 +32,15 @@ pub struct Sample {
     pub mu: Option<i32>,
     /// 显存占用率（%）。协议 key = `GV`；固件 v24 不认这个 key（忽略），屏上暂不显示。
     pub gv: Option<i32>,
+    /// 主卡功耗（W）。协议 key = `GP`（Phase 5；固件 v24 忽略）。
+    pub gp: Option<i32>,
+    /// 副卡（显存第二大且非软件适配器）温度/利用率/风扇（协议 key `T2`/`U2`/`F2`，Phase 5）。
+    /// 只有一张卡时为 `None`。
+    pub gt2: Option<i32>,
+    pub gu2: Option<i32>,
+    pub gf2: Option<i32>,
+    /// 当前 GPU 数据来源（UI "数据来源" 标签用，Phase 4）。
+    pub source: Source,
     /// 风扇值的原始单位（只影响 UI 后缀显示）
     pub cf_unit: FanUnit,
     pub gf_unit: FanUnit,
@@ -115,6 +125,10 @@ impl Sample {
             "GF" => self.gf,
             "MU" => self.mu,
             "GV" => self.gv,
+            "GP" => self.gp,
+            "T2" => self.gt2,
+            "U2" => self.gu2,
+            "F2" => self.gf2,
             _ => None,
         }
     }
@@ -165,7 +179,10 @@ pub fn lhm_alive() -> bool {
 /// 返回 (ct, cf, gt, gf)；拿不到的项为 None（**不要用 0 冒充**）。
 /// 风扇带单位（`FanReading`）：LHM 的叶子值自带单位后缀 —— `1050 RPM` 或 `60 %`，
 /// 这里按后缀判定，不再假设"一定是 RPM"。
-fn lhm_sample() -> (Option<i32>, Option<FanReading>, Option<i32>, Option<FanReading>) {
+///
+/// `gpu_name`：Phase 4 起按选中卡的名字去匹配 LHM 里的显卡分组（不再是"第一个命中关键词"），
+/// 多卡机器（iGPU + dGPU）才能正确挑中独显。`None` 退回旧的"首张 GPU"行为。
+pub fn lhm_sample(gpu_name: Option<&str>) -> (Option<i32>, Option<FanReading>, Option<i32>, Option<FanReading>) {
     let text = match http_get(LHM_URL, "/data.json", 2500) {
         Ok(t) => t,
         Err(_) => return (None, None, None, None),
@@ -174,15 +191,18 @@ fn lhm_sample() -> (Option<i32>, Option<FanReading>, Option<i32>, Option<FanRead
         Ok(v) => v,
         Err(_) => return (None, None, None, None),
     };
-    lhm_parse(&root)
+    lhm_parse(&root, gpu_name)
 }
 
 /// 纯解析（把 JSON 树 → 4 个读数），**不碰网络** —— 便于用固定样本做回归测试。
-fn lhm_parse(root: &Value) -> (Option<i32>, Option<FanReading>, Option<i32>, Option<FanReading>) {
+fn lhm_parse(root: &Value, gpu_name: Option<&str>) -> (Option<i32>, Option<FanReading>, Option<i32>, Option<FanReading>) {
     // 摊平成 (路径, 叶子名, 值)；路径形如
     //   Sensor / <机器名> / <硬件名> / <分组> / <叶子>
     let mut leaves: Vec<(Vec<String>, String, String)> = Vec::new();
     walk(&root, &mut Vec::new(), &mut leaves);
+
+    let want = gpu_name.map(normalize_name);
+    let mut target_seen = false; // 有没有 LHM 分组真正匹配上选中的卡名
 
     let mut cpu_core_max: Option<f64> = None;
     let mut cpu_package: Option<f64> = None;
@@ -191,12 +211,18 @@ fn lhm_parse(root: &Value) -> (Option<i32>, Option<FanReading>, Option<i32>, Opt
     //   ⇒ 分开收集，最后 **RPM 优先**（PWM 只是"没有转速线/只有百分比"时的兜底）。
     let mut cpu_fan_rpm: Option<FanReading> = None;
     let mut cpu_fan_pct: Option<FanReading> = None;
-    let mut gpu_temp: Option<f64> = None;
-    let mut gpu_fan_rpm: Option<FanReading> = None;
-    let mut gpu_fan_pct: Option<FanReading> = None;
+    // GPU 读数分两路：目标卡（名字匹配）与兜底（首张 GPU）。
+    // 名字没匹配上时退回兜底，保证单卡机器不丢失数据（零回归）。
+    let mut t_gpu_temp: Option<f64> = None;
+    let mut t_gpu_fan_rpm: Option<FanReading> = None;
+    let mut t_gpu_fan_pct: Option<FanReading> = None;
+    let mut f_gpu_temp: Option<f64> = None;
+    let mut f_gpu_fan_rpm: Option<FanReading> = None;
+    let mut f_gpu_fan_pct: Option<FanReading> = None;
 
     for (path, leaf, value) in &leaves {
         let hw = hw_name(path).to_lowercase();
+        let hw_norm = normalize_name(&hw);
         let ll = leaf.to_lowercase();
         let lv = value.to_lowercase();
         let num = match first_num(value) {
@@ -211,6 +237,16 @@ fn lhm_parse(root: &Value) -> (Option<i32>, Option<FanReading>, Option<i32>, Opt
             .iter()
             .any(|k| hw.contains(k));
 
+        // 选中卡名匹配：DXGI 名（如 "Intel(R) Arc(TM) A770 Graphics"）与 LHM 名
+        // （如 "Intel Arc A770 Graphics"）去噪后双向子串匹配。
+        let is_target = match &want {
+            Some(w) => hw_matches(&hw_norm, w),
+            None => true,
+        };
+        if want.is_some() && is_gpu && hw_matches(&hw_norm, want.as_ref().unwrap()) {
+            target_seen = true;
+        }
+
         if lv.contains("°c") {
             // 阈值/余量不是实测温度
             if ["warning temperature", "critical temperature", "distance to tjmax",
@@ -220,8 +256,14 @@ fn lhm_parse(root: &Value) -> (Option<i32>, Option<FanReading>, Option<i32>, Opt
             {
                 continue;
             }
-            if is_gpu && ll.contains("gpu core") && gpu_temp.is_none() {
-                gpu_temp = Some(num);
+            if is_gpu && ll.contains("gpu core") {
+                if is_target {
+                    if t_gpu_temp.is_none() {
+                        t_gpu_temp = Some(num);
+                    }
+                } else if f_gpu_temp.is_none() {
+                    f_gpu_temp = Some(num);
+                }
             } else if !is_gpu && !is_superio {
                 if ll.contains("core max") {
                     cpu_core_max = Some(num);
@@ -244,10 +286,16 @@ fn lhm_parse(root: &Value) -> (Option<i32>, Option<FanReading>, Option<i32>, Opt
             };
 
             if is_gpu && ll.contains("gpu fan") {
-                if is_rpm {
-                    let _ = gpu_fan_rpm.get_or_insert(read);
+                if is_target {
+                    if is_rpm {
+                        let _ = t_gpu_fan_rpm.get_or_insert(read);
+                    } else {
+                        let _ = t_gpu_fan_pct.get_or_insert(read);
+                    }
+                } else if is_rpm {
+                    let _ = f_gpu_fan_rpm.get_or_insert(read);
                 } else {
-                    let _ = gpu_fan_pct.get_or_insert(read);
+                    let _ = f_gpu_fan_pct.get_or_insert(read);
                 }
             } else if is_superio && leaf.eq_ignore_ascii_case(CPU_FAN_NAME) {
                 if is_rpm {
@@ -260,8 +308,62 @@ fn lhm_parse(root: &Value) -> (Option<i32>, Option<FanReading>, Option<i32>, Opt
     }
 
     let ct = cpu_core_max.or(cpu_package).map(|v| v.round() as i32);
-    let gt = gpu_temp.map(|v| v.round() as i32);
-    (ct, cpu_fan_rpm.or(cpu_fan_pct), gt, gpu_fan_rpm.or(gpu_fan_pct))
+    // 目标卡有值用目标卡；目标卡某字段缺失且整张卡名都没匹配上（选卡名与 LHM 对不上）
+    // 时，退回首张 GPU 的兜底值，避免单卡机器因名字对不齐而丢数据。
+    let gt = pick_target(t_gpu_temp, &want, target_seen, f_gpu_temp).map(|v| v.round() as i32);
+    let gf_target = t_gpu_fan_rpm.or(t_gpu_fan_pct);
+    let gf_fb = f_gpu_fan_rpm.or(f_gpu_fan_pct);
+    let gf = if gf_target.is_none() && want.is_some() && !target_seen {
+        gf_fb
+    } else {
+        gf_target
+    };
+    (ct, cpu_fan_rpm.or(cpu_fan_pct), gt, gf)
+}
+
+/// 归一化卡名：先去掉括号及其内容（DXGI 常写 `Intel(R) Arc(TM) A770`），
+/// 再只保留字母数字并小写，使 `Intel(R) Arc(TM) A770 Graphics` 与
+/// `Intel Arc A770 Graphics` 变成同一个串，便于双向子串比对。
+fn normalize_name(s: &str) -> String {
+    let mut cleaned = String::new();
+    let mut depth: i32 = 0;
+    for c in s.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            _ if depth == 0 => cleaned.push(c),
+            _ => {}
+        }
+    }
+    cleaned
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// 双向子串匹配：DXGI 名与 LHM 名可能差括号/空格/后缀（"Graphics"），
+/// 只要一方包含另一方即视为同一张卡。太短的名字（<6）不可靠，直接判否。
+fn hw_matches(hw_norm: &str, want_norm: &str) -> bool {
+    if hw_norm.len() < 6 || want_norm.len() < 6 {
+        return false;
+    }
+    want_norm.contains(hw_norm) || hw_norm.contains(want_norm)
+}
+
+/// 目标卡字段优先；仅当"整张卡名都没匹配上"时才退回兜底（防止选卡名与 LHM 对不齐时丢数据）。
+fn pick_target(target: Option<f64>, want: &Option<String>, seen: bool, fb: Option<f64>) -> Option<f64> {
+    if target.is_some() {
+        target
+    } else if want.is_some() && !seen {
+        fb
+    } else {
+        target
+    }
 }
 
 /// 调试用（`--probe-gpu`）：把 LHM `data.json` 摊平成 (硬件名, 分组, "叶子=值")。
@@ -702,7 +804,7 @@ fn wide(s: &str) -> Vec<u16> {
 /// ⚠ 2026-10-25 修：原来**不按适配器过滤**，把所有卡的 `engtype_3D` 实例一起相加 ——
 /// 核显+独显（笔记本 / AM5 带 iGPU）会虚高，双卡机器更是错的。
 /// 现在按 LUID 过滤到目标卡（`luid_tag`）；`None` 才退回旧的"全机相加"行为。
-pub struct GpuUsage {
+pub struct PdhGpuState {
     query: isize,
     counter: isize,
     luid_tag: Option<String>,
@@ -710,6 +812,7 @@ pub struct GpuUsage {
     last_matched: u32,
     last_total: u32,
     /// 这张卡的名字（来自 DXGI），用于界面/日志。
+    #[allow(dead_code)] // 字段经 facade(GpuUsage::adapter_name) 暴露，旧直接读取路径已迁走
     adapter_name: Option<String>,
     /// 这张卡在 DXGI 里的序号（查显存占用要用它重新取 adapter）。
     adapter_index: Option<u32>,
@@ -718,7 +821,8 @@ pub struct GpuUsage {
     vram: Option<GpuVram>,
 }
 
-impl GpuUsage {
+#[allow(dead_code)] // new()/adapter_name()/vram_percent() 等由 GpuUsage 门面暴露，旧直接路径已迁走
+impl PdhGpuState {
     /// 自动选主 GPU（显存最大的非软件适配器）。
     pub fn new() -> Option<Self> {
         let adapters = enumerate_adapters();
@@ -868,6 +972,16 @@ impl GpuUsage {
             Some(total_3d.round().clamp(0.0, 100.0) as i32)
         }
     }
+
+    /// 专用显存（字节）：(已用, 总)。供 `LhmPdhBackend` 转 MB 用。
+    pub fn mem_bytes(&mut self) -> Option<(u64, u64)> {
+        let total = self.vram_total;
+        if total == 0 {
+            return None;
+        }
+        let used = self.vram.as_mut()?.used_bytes()?;
+        Some((used, total))
+    }
 }
 
 unsafe fn pcwstr_to_string(p: *const u16) -> String {
@@ -885,26 +999,59 @@ unsafe fn pcwstr_to_string(p: *const u16) -> String {
 }
 
 /// 采集一帧完整数据。拿不到的项保持 None。
-pub fn collect(cpu: &mut CpuUsage, gpu: &mut Option<GpuUsage>) -> Sample {
-    let (ct, cf, gt, gf) = lhm_sample();
-    let gu = gpu.as_mut().and_then(|g| g.sample());
-    let gv = gpu.as_mut().and_then(|g| g.vram_percent());
+///
+/// GPU 部分（温度/利用率/风扇/显存）统一走 [`crate::gpu::GpuUsage`] 门面
+/// （内部经 `Resolver` 合并各后端），每帧只驱动一次采样，避免重复 LHM 取数。
+pub fn collect(cpu: &mut CpuUsage, gpu: &mut Option<crate::gpu::GpuUsage>) -> Sample {
+    // CPU 温度/风扇走 LHM；GPU 部分交给门面（一次 read_full）。
+    let (ct, cf, _gt, _gf) = lhm_sample(None);
+    let gs = gpu.as_mut().and_then(|g| g.read_full());
+    let (gu, gv) = match &gs {
+        Some(s) => (s.util_pct, s.mem_pct()),
+        None => (None, None),
+    };
+    let gf_reading = gs.as_ref().and_then(|s| s.fan);
+    let gp = gs.as_ref().and_then(|s| s.power_w).map(|w| w.round() as i32);
+    let source = gs.as_ref().map(|s| s.source).unwrap_or(Source::LhmPdh);
+
+    // Phase 5：副卡（显存第二大且非软件）的温度/利用率/风扇。
+    let g2 = {
+        let adapters = gpu.as_ref().map(|g| g.enumerate()).unwrap_or_default();
+        let mut sorted: Vec<_> = adapters.iter().filter(|k| !k.software).cloned().collect();
+        sorted.sort_by_key(|k| std::cmp::Reverse(k.vram_bytes));
+        sorted
+            .get(1)
+            .and_then(|k| gpu.as_mut().and_then(|g| g.read_key(k)))
+    };
+    let gt2 = g2.as_ref().and_then(|s| s.temp_c);
+    let gu2 = g2.as_ref().and_then(|s| s.util_pct);
+    let gf2 = g2.as_ref().and_then(|s| s.fan).map(|f| f.wire());
+
     Sample {
         ct,
         cu: cpu.sample(),
         // 风扇按单位换算成协议值：RPM 直发，百分比 ×20（见 FanUnit 的说明）
         cf: cf.map(|f| f.wire()),
-        gt,
+        gt: gs.as_ref().and_then(|s| s.temp_c),
         gu,
-        gf: gf.map(|f| f.wire()),
+        gf: gf_reading.map(|f| f.wire()),
         mu: mem_percent(),
         gv,
+        gp,
+        gt2,
+        gu2,
+        gf2,
+        source,
         cf_unit: cf.map(|f| f.unit).unwrap_or(FanUnit::Rpm),
-        gf_unit: gf.map(|f| f.unit).unwrap_or(FanUnit::Rpm),
+        gf_unit: gf_reading.map(|f| f.unit).unwrap_or(FanUnit::Rpm),
         cf_display: cf.map(|f| f.display()),
-        gf_display: gf.map(|f| f.display()),
+        gf_display: gf_reading.map(|f| f.display()),
     }
 }
+
+/// 兼容门面：对外仍是 `collector::GpuUsage`，但实现委托给 `gpu::Resolver`
+/// （多后端合并；本机只有 LHM/PDH 后端，行为不变）。app.rs / main.rs 零改动。
+pub use crate::gpu::GpuUsage;
 
 #[cfg(test)]
 mod gpu_tests {
@@ -929,7 +1076,7 @@ mod gpu_tests {
         let p = pick_primary_adapter(&adapters).expect("应存在非软件适配器");
         println!("primary = {} ({})", p.name, p.vendor_name());
 
-        let mut g = GpuUsage::new_for_luid(p.luid_high, p.luid_low).expect("PDH 查询应能打开");
+        let mut g = PdhGpuState::new_for_luid(p.luid_high, p.luid_low).expect("PDH 查询应能打开");
         // 速率计数器要两次采集（间隔 ≥200ms）才有值
         std::thread::sleep(std::time::Duration::from_millis(400));
         let v = g.sample();
@@ -940,7 +1087,7 @@ mod gpu_tests {
         assert!(matched > 0, "按 LUID 过滤后必须命中实例（否则 LUID 片段格式不对）");
 
         // 显存占用率（PDH \GPU Adapter Memory）：本机有真显卡就该有值
-        let mut gv = GpuUsage::new_for_luid(p.luid_high, p.luid_low)
+        let mut gv = PdhGpuState::new_for_luid(p.luid_high, p.luid_low)
             .expect("PDH 打开")
             .with_index(p.index);
         let vram = gv.vram_percent().expect("显存占用应能取到");
@@ -978,7 +1125,7 @@ mod gpu_tests {
           }]
         }"#;
         let root: Value = serde_json::from_str(json).unwrap();
-        let (_ct, cf, _gt, _gf) = lhm_parse(&root);
+        let (_ct, cf, _gt, _gf) = lhm_parse(&root, None);
         let cf = cf.expect("应取到 CPU 风扇");
         assert_eq!(cf.unit, FanUnit::Rpm, "必须优先 RPM，不能被 Controls 的百分比覆盖");
         assert_eq!(cf.raw, 713);
@@ -998,12 +1145,44 @@ mod gpu_tests {
           }]}]
         }"#;
         let root: Value = serde_json::from_str(json).unwrap();
-        let (_ct, _cf, gt, gf) = lhm_parse(&root);
+        let (_ct, _cf, gt, gf) = lhm_parse(&root, None);
         assert_eq!(gt, Some(62));
         let gf = gf.expect("应取到 GPU 风扇");
         assert_eq!(gf.unit, FanUnit::Percent);
         assert_eq!(gf.wire(), 1200, "60% × 20");
         assert_eq!(gf.display(), 60, "界面必须显示 60 而不是 1200 或 1200%");
+    }
+
+    /// Phase 4 核心回归：多卡时按"选中卡的名字"挑 LHM 分组，而不是"第一个命中关键词"。
+    /// 这里放两张卡：NVIDIA(70°C, 在前) + Intel Arc(53°C, 在后)。
+    ///   - 不过滤 → 取第一张（NVIDIA, 70）；
+    ///   - 过滤 "Intel(R) Arc(TM) A770 Graphics" → 应命中第二张（Arc, 53），
+    ///     且能跨括号/空格/Graphics 后缀归一化匹配。
+    #[test]
+    fn lhm_parse_selects_named_gpu_among_multiple() {
+        let json = r#"{
+          "Text": "Sensor", "Children": [{"Text": "PC", "Children": [
+            {"Text": "NVIDIA GeForce RTX 4070", "Children": [
+              {"Text": "Temperatures", "Children": [{"Text": "GPU Core", "Value": "70.0 °C"}]},
+              {"Text": "Fans", "Children": [{"Text": "GPU Fan", "Value": "1500 RPM"}]}
+            ]},
+            {"Text": "Intel Arc A770 Graphics", "Children": [
+              {"Text": "Temperatures", "Children": [{"Text": "GPU Core", "Value": "53.0 °C"}]},
+              {"Text": "Fans", "Children": [{"Text": "GPU Fan", "Value": "800 RPM"}]}
+            ]}
+          ]}]
+        }"#;
+        let root: Value = serde_json::from_str(json).unwrap();
+
+        // 不过滤：取第一张 = NVIDIA 70°C
+        let (_ct, _cf, gt, _gf) = lhm_parse(&root, None);
+        assert_eq!(gt, Some(70), "无过滤应取第一张 GPU（NVIDIA）");
+
+        // 按名过滤到 Arc（名字带括号/空格差异）→ 53°C，证明挑中了第二张而非第一张
+        let (_ct, _cf, gt, gf) = lhm_parse(&root, Some("Intel(R) Arc(TM) A770 Graphics"));
+        assert_eq!(gt, Some(53), "应跨括号/空格归一化匹配到 Intel Arc");
+        let gf = gf.expect("Arc 风扇应取到");
+        assert_eq!(gf.raw, 800, "风扇也应来自 Arc 而非 NVIDIA");
     }
 
     /// 现场验证（需要 LHM 在跑，默认 ignore）：
@@ -1013,7 +1192,7 @@ mod gpu_tests {
     #[ignore]
     fn live_lhm_sanity() {
         assert!(lhm_alive(), "LHM 没在跑，先启动上位机");
-        let (ct, cf, gt, gf) = lhm_sample();
+        let (ct, cf, gt, gf) = lhm_sample(None);
         println!("live: ct={ct:?} cf={cf:?} gt={gt:?} gf={gf:?}");
         if let Some(f) = cf {
             println!("  CPU 风扇: raw={} unit={:?} wire={} display={}",

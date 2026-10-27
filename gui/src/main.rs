@@ -3,6 +3,7 @@
 mod app;
 mod board;
 mod collector;
+mod gpu;
 mod lhm;
 mod tray;
 
@@ -209,6 +210,32 @@ fn probe_gpu() {
             "自动选卡(GpuUsage::new, 实际采集在用的就是这张): {}",
             g.adapter_name().unwrap_or("(未命名)")
         );
+    }
+
+    // 2c) Resolver 逐卡读取（验证 Phase 4 选卡 + LHM 按名匹配）
+    say!("\n--- Resolver 逐卡读取（含来源标签）---");
+    if let Some(g) = collector::GpuUsage::new() {
+        let adapters = g.enumerate();
+        for (i, a) in adapters.iter().enumerate() {
+            if a.software {
+                continue;
+            }
+            match g.read_key(a) {
+                Some(s) => say!(
+                    "  [{}] {}: T={:?}°C U={:?}% F={:?} 来源={:?}",
+                    i,
+                    a.name,
+                    s.temp_c,
+                    s.util_pct,
+                    s.fan.map(|f| f.display()),
+                    s.source
+                ),
+                None => say!("  [{}] {}: 读取失败", i, a.name),
+            }
+        }
+        if adapters.len() >= 2 {
+            say!("（检测到多张卡：index 1 即副卡，协议 T2/U2/F2 会发它的数据）");
+        }
     }
 
     // 3) 厂商库 DLL 是否在场（决定 NVML / ADL 后端能不能落地）

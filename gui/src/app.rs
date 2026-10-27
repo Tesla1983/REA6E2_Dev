@@ -9,6 +9,7 @@ use eframe::egui;
 
 use crate::board::{self, Board};
 use crate::collector::{self, CpuUsage, GpuUsage, Sample};
+use crate::gpu::{AdapterKey, Source};
 
 // ---------------------------------------------------------------- 共享状态
 
@@ -24,6 +25,14 @@ struct Shared {
     started: Option<Instant>,
     link_up: bool,
     rate: f32,
+    /// 当前 GPU 数据来源（UI "数据来源" 标签用，Phase 4）。
+    gpu_source: Source,
+    /// 所有已知适配器（按显存降序），供 UI 选卡下拉（Phase 4）。index 0 = 主卡。
+    gpu_adapters: Vec<AdapterKey>,
+    /// UI 选中的卡（下拉索引）。
+    gpu_selection: usize,
+    /// 已应用到采集端的选卡（用来检测变化，避免每帧都 force）。
+    gpu_selection_applied: usize,
 }
 
 /// 勾选状态。组开关关掉时，组内细项灰掉且不生效。
@@ -39,6 +48,11 @@ pub struct Mask {
     pub gpu_fan: bool,
     /// 显存占用率（协议 key `GV`）。**默认不勾**（屏上暂不显示，只在上位机看）。
     pub gpu_vram: bool,
+    /// 主卡功耗（协议 key `GP`，Phase 5；固件 v24 忽略该 key）。
+    pub gpu_power: bool,
+    /// 副卡（显存第二大且非软件）温度/利用率/风扇（协议 key `T2`/`U2`/`F2`，Phase 5）。
+    /// 默认不勾：多数机器只有一张卡，且固件 v24 还不会显示双卡。
+    pub gpu_secondary: bool,
     pub mem: bool,
 }
 
@@ -54,6 +68,8 @@ impl Default for Mask {
             gpu_load: true,
             gpu_fan: true,
             gpu_vram: false,
+            gpu_power: true,
+            gpu_secondary: false,
             mem: true,
         }
     }
@@ -70,6 +86,10 @@ impl Mask {
             (self.gpu_group && self.gpu_load, "GU"),
             (self.gpu_group && self.gpu_fan, "GF"),
             (self.gpu_group && self.gpu_vram, "GV"),
+            (self.gpu_group && self.gpu_power, "GP"),
+            (self.gpu_group && self.gpu_secondary, "T2"),
+            (self.gpu_group && self.gpu_secondary, "U2"),
+            (self.gpu_group && self.gpu_secondary, "F2"),
             (self.mem, "MU"),
         ]
     }
@@ -386,6 +406,18 @@ fn monitor(shared: Arc<Mutex<Shared>>, mask: Arc<Mutex<Mask>>, log: Sender<Strin
         say("PDH 的 GPU Engine 计数器不可用，GPU 使用率将缺失".into());
     }
 
+    // Phase 4：枚举适配器写进 Shared 供 UI 下拉（按显存降序，index 0 = 主卡）；
+    // 默认选主卡（与 GpuUsage::new 内部选卡一致）。
+    if let Some(g) = &gpu {
+        let mut adapters = g.enumerate();
+        adapters.sort_by_key(|k| std::cmp::Reverse(k.vram_bytes));
+        if let Ok(mut s) = shared.lock() {
+            s.gpu_adapters = adapters;
+            s.gpu_selection = 0;
+            s.gpu_selection_applied = 0;
+        }
+    }
+
     // 已打开的串口（port 名 + 句柄）。None = 当前不发送。
     let mut open: Option<(String, board::RawSerial)> = None;
     let period = Duration::from_millis(1000);
@@ -393,8 +425,34 @@ fn monitor(shared: Arc<Mutex<Shared>>, mask: Arc<Mutex<Mask>>, log: Sender<Strin
     loop {
         let tick = Instant::now();
 
+        // 0) 应用 UI 选卡：仅当选择变化时才 force 一次（避免每帧重建后端句柄）。
+        {
+            let need_force = shared
+                .lock()
+                .ok()
+                .map(|s| s.gpu_selection != s.gpu_selection_applied)
+                .unwrap_or(false);
+            if need_force {
+                let key = shared
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.gpu_adapters.get(s.gpu_selection).cloned());
+                if let (Some(k), Some(g)) = (key, gpu.as_mut()) {
+                    g.force(k);
+                    if let Ok(mut s) = shared.lock() {
+                        s.gpu_selection_applied = s.gpu_selection;
+                    }
+                }
+            }
+        }
+
         // 1) 采样（无条件）
         let sample = collector::collect(&mut cpu, &mut gpu);
+
+        // 把当前数据来源写回 Shared 供 UI "数据来源" 标签显示。
+        if let Ok(mut s) = shared.lock() {
+            s.gpu_source = sample.source;
+        }
 
         // 2) 串口状态跟随 want_port
         let want = shared.lock().ok().and_then(|s| s.want_port.clone());
@@ -1117,6 +1175,40 @@ impl App {
                 });
             });
         });
+
+        // Phase 4：选卡下拉 + 数据来源标签（多卡机器挑中独显；来源告诉用户数值来自哪家）
+        {
+            let (adapters, sel, src) = match self.shared.lock().ok() {
+                Some(s) => (s.gpu_adapters.clone(), s.gpu_selection, s.gpu_source),
+                None => (Vec::new(), 0usize, Source::LhmPdh),
+            };
+            if !adapters.is_empty() {
+                let names: Vec<String> = adapters
+                    .iter()
+                    .map(|a| {
+                        let tag = if a.software { " (软件)" } else { "" };
+                        format!("[{}] {}{}", a.vendor.name(), a.name, tag)
+                    })
+                    .collect();
+                let mut sel = sel.min(names.len().saturating_sub(1));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("选卡:").size(11.0).weak());
+                    egui::ComboBox::from_label("")
+                        .selected_text(names[sel].as_str())
+                        .show_index(ui, &mut sel, names.len(), |i| names[i].clone());
+                });
+                if let Ok(mut s) = self.shared.lock() {
+                    s.gpu_selection = sel;
+                }
+                ui.label(
+                    egui::RichText::new(format!("数据来源: {}", src.label()))
+                        .size(11.0)
+                        .weak(),
+                );
+            }
+        }
+
 
         ui.add_space(6.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
