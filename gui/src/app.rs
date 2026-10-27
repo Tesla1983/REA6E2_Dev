@@ -1173,14 +1173,14 @@ impl App {
             // bottom_row：底对齐 + 可换行（窗口窄或 zoom 调大时自动换行）
             bottom_row(ui, |ui| {
                 ui.add_enabled_ui(self.mask.cpu_group, |ui| {
-                    ui.checkbox(&mut self.mask.cpu_temp, T::Temp.t(self.lang));
-                    ui.label(egui::RichText::new(fmt(sample.ct, "°C")).size(11.0).monospace().color(READOUT_GREEN));
+                    ui.checkbox(&mut self.mask.cpu_temp, egui::RichText::new(T::Temp.t(self.lang)).size(14.0));
+                    ui.label(egui::RichText::new(fmt(sample.ct, "°C")).size(14.0).monospace().color(READOUT_GREEN));
                     ui.add_space(10.0);
-                    ui.checkbox(&mut self.mask.cpu_load, T::Load.t(self.lang));
-                    ui.label(egui::RichText::new(fmt(sample.cu, "%")).size(11.0).monospace().color(READOUT_GREEN));
+                    ui.checkbox(&mut self.mask.cpu_load, egui::RichText::new(T::Load.t(self.lang)).size(14.0));
+                    ui.label(egui::RichText::new(fmt(sample.cu, "%")).size(14.0).monospace().color(READOUT_GREEN));
                     ui.add_space(10.0);
-                    ui.checkbox(&mut self.mask.cpu_fan, T::Fan.t(self.lang));
-                    ui.label(egui::RichText::new(fmt(sample.cf_display, sample.cf_unit.suffix())).size(11.0).monospace().color(READOUT_GREEN));
+                    ui.checkbox(&mut self.mask.cpu_fan, egui::RichText::new(T::Fan.t(self.lang)).size(14.0));
+                    ui.label(egui::RichText::new(fmt(sample.cf_display, sample.cf_unit.suffix())).size(14.0).monospace().color(READOUT_GREEN));
                 });
             });
         });
@@ -1192,17 +1192,17 @@ impl App {
             ui.add_space(4.0);
             bottom_row(ui, |ui| {
                 ui.add_enabled_ui(self.mask.gpu_group, |ui| {
-                    ui.checkbox(&mut self.mask.gpu_temp, T::Temp.t(self.lang));
-                    ui.label(egui::RichText::new(fmt(sample.gt, "°C")).size(11.0).monospace().color(READOUT_GREEN));
+                    ui.checkbox(&mut self.mask.gpu_temp, egui::RichText::new(T::Temp.t(self.lang)).size(14.0));
+                    ui.label(egui::RichText::new(fmt(sample.gt, "°C")).size(14.0).monospace().color(READOUT_GREEN));
                     ui.add_space(10.0);
-                    ui.checkbox(&mut self.mask.gpu_load, T::Load.t(self.lang));
-                    ui.label(egui::RichText::new(fmt(sample.gu, "%")).size(11.0).monospace().color(READOUT_GREEN));
+                    ui.checkbox(&mut self.mask.gpu_load, egui::RichText::new(T::Load.t(self.lang)).size(14.0));
+                    ui.label(egui::RichText::new(fmt(sample.gu, "%")).size(14.0).monospace().color(READOUT_GREEN));
                     ui.add_space(10.0);
-                    ui.checkbox(&mut self.mask.gpu_fan, T::Fan.t(self.lang));
-                    ui.label(egui::RichText::new(fmt(sample.gf_display, sample.gf_unit.suffix())).size(11.0).monospace().color(READOUT_GREEN));
+                    ui.checkbox(&mut self.mask.gpu_fan, egui::RichText::new(T::Fan.t(self.lang)).size(14.0));
+                    ui.label(egui::RichText::new(fmt(sample.gf_display, sample.gf_unit.suffix())).size(14.0).monospace().color(READOUT_GREEN));
                     ui.add_space(10.0);
-                    ui.checkbox(&mut self.mask.gpu_vram, T::Vram.t(self.lang));
-                    ui.label(egui::RichText::new(fmt(sample.gv, "%")).size(11.0).monospace().color(READOUT_GREEN));
+                    ui.checkbox(&mut self.mask.gpu_vram, egui::RichText::new(T::Vram.t(self.lang)).size(14.0));
+                    ui.label(egui::RichText::new(fmt(sample.gv, "%")).size(14.0).monospace().color(READOUT_GREEN));
                 });
             });
         });
@@ -1247,7 +1247,7 @@ impl App {
             bottom_row(ui, |ui| {
                 ui.checkbox(&mut self.mask.mem, egui::RichText::new(T::Memory.t(self.lang)).size(12.0).strong());
                 // 间距由 item_spacing.x 提供，别再叠加 add_space（会变成 16px）
-                ui.label(egui::RichText::new(fmt(sample.mu, "%")).size(11.0).monospace().color(READOUT_GREEN));
+                ui.label(egui::RichText::new(fmt(sample.mu, "%")).size(12.0).monospace().color(READOUT_GREEN));
             });
         });
 
@@ -1287,21 +1287,30 @@ impl App {
     }
 }
 
-/// 「标签 + 数值」一行的容器：**交叉轴底对齐**（`Align::Max`）。
+/// 「标签 + 数值」一行的容器：**行内垂直居中**（`Align::Center`）。
 ///
-/// ⚠⚠ 这里必须用 `allocate_ui_with_layout` 显式给"一行"的高度，
+/// ⚠⚠ 必须用 `allocate_ui_with_layout` 显式给"一行"的高度，
 ///   **不能用 `ui.with_layout()`** —— 后者会把**全部可用高度**都吃掉，
 ///   而 `Frame::group` 是按子 UI 的 `min_rect` 撑开的：
-///   ⇒ 卡片被撑到整屏高、内容被 `Align::Max` 压到卡片最底部、
-///     后面的组和卡片全被挤出窗口（2026-10-24 实测截图确认）。
+///   ⇒ 卡片被撑到整屏高、后面的组和卡片全被挤出窗口（2026-10-24 实测截图确认）。
+///
+/// ⚠⚠ egui 0.37 **没有 baseline（文字基线）对齐机制**（`Layout` 只有按矩形边的
+///   Min / Center / Max）。而 checkbox 控件高度 = `max(icon_width=14, 文字)`
+///   且其内部文字**永远垂直居中**（见 `CheckboxStyle` 注释），右侧数值是
+///   独立的 `Label`（高度 = galley 高）。两者高度/字号只要不一致，
+///   按 Min/Center/Max 对边都会错位：Max→数值偏低、Min/Center→数值偏高。
+///
+///   因此**根本解法是让标签和数值用同一字号**（CPU/GPU 子项统一 14 号、
+///   内存行统一 12 号），再用 `Align::Center` 让两者在行内垂直居中——
+///   同字号 + 同中线 ⇒ 文字顶/底完全重合。这是唯一在 0.37 上稳定成立的对齐方式。
 ///
 /// 代价：这一行**不会自动换行**了（固定单行高度）。
 /// 窗口很窄时宁可横向溢出，也不要布局被撑坏 —— 溢出至少看得见、能调窗口。
 fn bottom_row<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let height = ui.spacing().interact_size.y; // 标准控件行高（≈ checkbox 高度）
+    let height = ui.spacing().interact_size.y; // 标准控件行高
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width(), height),
-        egui::Layout::left_to_right(egui::Align::Max),
+        egui::Layout::left_to_right(egui::Align::Center),
         add,
     )
     .inner
