@@ -1,69 +1,66 @@
-# ============================================================
-# RA6E2 固件 CI/CD
-# ------------------------------------------------------------
-# 触发:
-#   - 推送到 main / 任意 PR             → 编译验证 + 上传构建产物(artifact)
-#   - 推送版本标签 v*.*.*               → 编译 + 创建 GitHub Release 并上传固件(公开可下载)
-#
-# 产物(均在 build/ 下, 由 cmake/PostBuild.cmake 生成):
-#   ra6e2_fw.elf / .hex / .bin / .srec / .map
-# 其中 .bin 是给烧录工具/上位机用的裸镜像; .hex 方便多数编程器; .elf 含调试符号。
-#
-# 工具链: GitHub Ubuntu runner 自带 apt 源安装 gcc-arm-none-eabi(含 newlib-nano),
-#         无需外链下载。版本与本地 14.3 rel1 略有差异但对本固件无功能影响;
-#         若需严格版本对齐, 可改用 xpack / arm-none-eabi-gcc-action 并固定版本。
-# ============================================================
-
 name: Build RA6E2 Firmware
 
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    tags: ['v*.*.*']
   pull_request:
     branches: [main]
 
+# 发布 Release 需要写权限（仅 tag 推送时真正用到）; 普通分支/PR 构建用默认读权限即可。
 permissions:
-  contents: write   # 创建 Release + 上传资产所需
+  contents: write
+
+concurrency:
+  group: ci-firmware-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    name: Build firmware (${{ matrix.build-type }})
-    runs-on: ubuntu-latest
+    name: Build firmware (${{ matrix.config }})
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        build-type: [Release, Debug]   # Release=发版优化产物; Debug=调试配置回归
+        config: [Release, Debug]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install toolchain (arm-none-eabi-gcc + ninja)
+      # 固定版本的工具链(自带 newlib + binutils)，避免 apt 版本漂移 / 分裂包缺失，
+      # 也与本地 14.3 同代，不会触发 GCC 15 把兼容指针类型等默认升为错误。
+      - name: Install ARM GCC toolchain (pinned 14.2.rel1)
+        uses: carlosperate/arm-none-eabi-gcc-action@v1
+        with:
+          release: '14.2.rel1'
+
+      - name: Install Ninja
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-none-eabi ninja-build
+          sudo apt-get install -y ninja-build
+
+      - name: Toolchain diagnostics
+        run: |
           arm-none-eabi-gcc --version | head -1
+          which arm-none-eabi-objcopy arm-none-eabi-objdump
 
       - name: Configure (CMake + Ninja)
-        run: cmake -G Ninja -B build \
+        run: |
+          cmake -G Ninja -B build \
                 -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-ra6e2.cmake \
-                -DCMAKE_BUILD_TYPE=${{ matrix.build-type }}
+                -DCMAKE_BUILD_TYPE=${{ matrix.config }}
 
       - name: Build
         run: cmake --build build
 
-      - name: Show firmware size
-        run: cmake --build build -t size || true
-
       - name: List build artifacts
-        run: ls -la build/ra6e2_fw.*
+        run: ls -la build/ra6e2_fw.* 2>/dev/null || echo "NO ARTIFACTS"
 
-      # ---- 每次构建都上传产物(artifact), 便于 PR / 分支预览下载 ----
       - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ra6e2-firmware-${{ matrix.build-type }}
+          name: firmware-${{ matrix.config }}
           path: |
             build/ra6e2_fw.elf
             build/ra6e2_fw.hex
@@ -75,38 +72,37 @@ jobs:
 
   release:
     name: Publish firmware release
-    # 仅当推送版本标签(v*)时发布; 直接取 build 矩阵里 Release 产物作为公开下载固件
+    # 仅当推送版本标签(v*)时发布; 取 Release 矩阵产物作为公开下载固件
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download Release artifact
+      - name: Download Release firmware artifacts
         uses: actions/download-artifact@v4
         with:
-          name: ra6e2-firmware-Release
-          path: build
+          name: firmware-Release
+          path: release-artifacts
 
-      - name: List downloaded artifacts
-        run: ls -la build/ra6e2_fw.*
-
-      - name: Draft release notes
+      - name: Draft release notes (构建信息)
         run: |
           {
             echo "## RA6E2 固件构建信息"
             echo ""
             echo "- 提交: \`${{ github.sha }}\`"
             echo "- 标签: \`${{ github.ref_name }}\`"
-            echo "- 目标: Renesas RA6E2 (R7FA6E2BB, Cortex-M33, 256KB Flash / 40KB SRAM)"
-            echo "- 构建类型: Release (-O2)"
+            echo "- 工具链: \`$(arm-none-eabi-gcc --version | head -1)\`"
+            echo "- 目标: Renesas RA6E2 (R7FA6E2BB, Cortex-M33)"
             echo ""
             echo "### 下载"
             echo "- \`ra6e2_fw.bin\` —— 裸镜像, 烧录工具/上位机直接用"
             echo "- \`ra6e2_fw.hex\` —— Intel HEX, 通用编程器"
             echo "- \`ra6e2_fw.elf\` —— 含调试符号"
             echo "- \`ra6e2_fw.map\` / \`ra6e2_fw.srec\` —— 链接映射 / Motorola S-record"
+            echo ""
+            echo "### 校验和"
+            echo '```'
+            sha256sum release-artifacts/ra6e2_fw.bin
+            echo '```'
           } > release_notes.md
           cat release_notes.md
 
@@ -114,11 +110,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            build/ra6e2_fw.elf
-            build/ra6e2_fw.hex
-            build/ra6e2_fw.bin
-            build/ra6e2_fw.srec
-            build/ra6e2_fw.map
+            release-artifacts/ra6e2_fw.elf
+            release-artifacts/ra6e2_fw.hex
+            release-artifacts/ra6e2_fw.bin
+            release-artifacts/ra6e2_fw.srec
+            release-artifacts/ra6e2_fw.map
           body_path: release_notes.md
           generate_release_notes: true
           make_latest: true
