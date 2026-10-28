@@ -1,5 +1,6 @@
 //! 主窗口：左「板子识别 + 连接」，右「发送数据项 + 实时帧 + 统计」。
 
+use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -13,6 +14,34 @@ use crate::gpu::{AdapterKey, Source};
 use crate::i18n::{status_text, Lang, LogMsg, T};
 
 // ---------------------------------------------------------------- 共享状态
+
+/// 曲线环形缓冲容量：120 点 × 250ms = 最近 30 秒。
+const HIST_CAP: usize = 120;
+
+/// 单条曲线的环形缓冲，按「旧 → 新」时间顺序存放。
+/// 缺测（`None`）存成 `NaN` 占位，绘制时按断线处理。
+#[derive(Clone, Default)]
+struct Ring(VecDeque<f32>);
+
+impl Ring {
+    fn push(&mut self, v: Option<f32>) {
+        if self.0.len() >= HIST_CAP {
+            self.0.pop_front();
+        }
+        self.0.push_back(v.unwrap_or(f32::NAN));
+    }
+}
+
+/// CPU / GPU 各三条曲线：温度、负载、风扇。
+#[derive(Clone, Default)]
+struct History {
+    ct: Ring,
+    cu: Ring,
+    cf: Ring,
+    gt: Ring,
+    gu: Ring,
+    gf: Ring,
+}
 
 #[derive(Default)]
 struct Shared {
@@ -34,6 +63,8 @@ struct Shared {
     gpu_selection: usize,
     /// 已应用到采集端的选卡（用来检测变化，避免每帧都 force）。
     gpu_selection_applied: usize,
+    /// CPU/GPU 曲线历史（监控线程写，UI 每帧取快照）。
+    hist: History,
 }
 
 /// 勾选状态。组开关关掉时，组内细项灰掉且不生效。
@@ -554,6 +585,13 @@ fn monitor(shared: Arc<Mutex<Shared>>, mask: Arc<Mutex<Mask>>, log: Sender<LogMs
 
         // 4) 把读数交给界面（未连接也更新，这就是"打开就有读数"）
         if let Ok(mut sh) = shared.lock() {
+            // 曲线历史：风扇必须用 _display（协议值已 ×20，画了会量纲错）
+            sh.hist.ct.push(sample.ct.map(|v| v as f32));
+            sh.hist.cu.push(sample.cu.map(|v| v as f32));
+            sh.hist.cf.push(sample.cf_display.map(|v| v as f32));
+            sh.hist.gt.push(sample.gt.map(|v| v as f32));
+            sh.hist.gu.push(sample.gu.map(|v| v as f32));
+            sh.hist.gf.push(sample.gf_display.map(|v| v as f32));
             sh.sample = sample;
         }
 
@@ -897,11 +935,12 @@ impl eframe::App for App {
             }
         }
 
-        let (sample, sent, errors, last_frame, link_up, rate, want_port) = {
+        let (sample, sent, errors, last_frame, link_up, rate, want_port, hist) = {
             let s = self.shared.lock().unwrap();
             (
                 s.sample.clone(), s.sent, s.errors,
                 s.last_frame.clone(), s.link_up, s.rate, s.want_port.clone(),
+                s.hist.clone(),
             )
         };
 
@@ -920,7 +959,7 @@ impl eframe::App for App {
             .show(ui, |ui| self.side_panel(ui));
 
         egui::CentralPanel::default_margins().show(ui, |ui| {
-            self.center_panel(ui, &sample, sent, errors, &last_frame, rate);
+            self.center_panel(ui, &sample, &hist, sent, errors, &last_frame, rate);
         });
 
         // 缩放（含 Ctrl+滚轮）与窗口大小变化 → 去抖后写盘
@@ -1198,6 +1237,7 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         sample: &Sample,
+        hist: &History,
         sent: u64,
         errors: u64,
         last_frame: &str,
@@ -1235,7 +1275,7 @@ impl App {
                             .show_index(ui, &mut sel, names.len(), |i| names[i].clone());
                         ui.add_space(16.0);
                         ui.label(
-                            egui::RichText::new(format!("{}: {}", T::Source.t(self.lang), src.label()))
+                            egui::RichText::new(format!("{} {}", T::Source.t(self.lang), src.label()))
                                 .size(11.0)
                                 .weak(),
                         );
@@ -1259,19 +1299,43 @@ impl App {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.checkbox(&mut self.mask.cpu_group, egui::RichText::new(T::Cpu.t(self.lang)).size(12.0).strong());
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             // bottom_row：底对齐 + 可换行（窗口窄或 zoom 调大时自动换行）
             bottom_row(ui, |ui| {
                 ui.add_enabled_ui(self.mask.cpu_group, |ui| {
                     ui.checkbox(&mut self.mask.cpu_temp, egui::RichText::new(T::Temp.t(self.lang)).size(14.0));
-                    ui.label(egui::RichText::new(fmt(sample.ct, "°C")).size(14.0).monospace().color(READOUT_GREEN));
-                    ui.add_space(10.0);
+                    readout_value(ui, &fmt(sample.ct, "°C"), 42.0, 14.0);
+                    ui.add_space(6.0);
                     ui.checkbox(&mut self.mask.cpu_load, egui::RichText::new(T::Load.t(self.lang)).size(14.0));
-                    ui.label(egui::RichText::new(fmt(sample.cu, "%")).size(14.0).monospace().color(READOUT_GREEN));
-                    ui.add_space(10.0);
+                    readout_value(ui, &fmt(sample.cu, "%"), 34.0, 14.0);
+                    ui.add_space(6.0);
                     ui.checkbox(&mut self.mask.cpu_fan, egui::RichText::new(T::Fan.t(self.lang)).size(14.0));
-                    ui.label(egui::RichText::new(fmt(sample.cf_display, sample.cf_unit.suffix())).size(14.0).monospace().color(READOUT_GREEN));
+                    readout_value(ui, &fmt(sample.cf_display, sample.cf_unit.suffix()), 68.0, 14.0);
                 });
+            });
+            // 卡片尾部迷你曲线：左侧三色图例 + 右侧 70% 宽趋势条
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let total_w = ui.available_width();
+            let bar_h = 18.0;
+            let spark_w = (total_w * 0.70).clamp(60.0, total_w);
+            let lang = self.lang;
+            let spec = [
+                (&hist.ct, SPARK_TEMP, 4.0, 0.04, 0.28),
+                (&hist.cf, SPARK_FAN, 100.0, 0.38, 0.62),
+                (&hist.cu, SPARK_LOAD, 5.0, 0.72, 0.96),
+            ];
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.allocate_ui_with_layout(
+                    egui::vec2((total_w - spark_w).max(0.0), bar_h),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        // 图例区宽度固定（曲线固定 70%）：英文文案更长时裁掉，避免压到曲线
+                        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
+                        spark_legend(ui, lang);
+                    },
+                );
+                sparkline(ui, bar_h, spark_w, &spec);
             });
         });
 
@@ -1279,21 +1343,45 @@ impl App {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.checkbox(&mut self.mask.gpu_group, egui::RichText::new(T::Gpu.t(self.lang)).size(12.0).strong());
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             bottom_row(ui, |ui| {
                 ui.add_enabled_ui(self.mask.gpu_group, |ui| {
                     ui.checkbox(&mut self.mask.gpu_temp, egui::RichText::new(T::Temp.t(self.lang)).size(14.0));
-                    ui.label(egui::RichText::new(fmt(sample.gt, "°C")).size(14.0).monospace().color(READOUT_GREEN));
-                    ui.add_space(10.0);
+                    readout_value(ui, &fmt(sample.gt, "°C"), 42.0, 14.0);
+                    ui.add_space(6.0);
                     ui.checkbox(&mut self.mask.gpu_load, egui::RichText::new(T::Load.t(self.lang)).size(14.0));
-                    ui.label(egui::RichText::new(fmt(sample.gu, "%")).size(14.0).monospace().color(READOUT_GREEN));
-                    ui.add_space(10.0);
+                    readout_value(ui, &fmt(sample.gu, "%"), 34.0, 14.0);
+                    ui.add_space(6.0);
                     ui.checkbox(&mut self.mask.gpu_fan, egui::RichText::new(T::Fan.t(self.lang)).size(14.0));
-                    ui.label(egui::RichText::new(fmt(sample.gf_display, sample.gf_unit.suffix())).size(14.0).monospace().color(READOUT_GREEN));
-                    ui.add_space(10.0);
+                    readout_value(ui, &fmt(sample.gf_display, sample.gf_unit.suffix()), 68.0, 14.0);
+                    ui.add_space(6.0);
                     ui.checkbox(&mut self.mask.gpu_vram, egui::RichText::new(T::Vram.t(self.lang)).size(14.0));
-                    ui.label(egui::RichText::new(fmt(sample.gv, "%")).size(14.0).monospace().color(READOUT_GREEN));
+                    readout_value(ui, &fmt(sample.gv, "%"), 34.0, 14.0);
                 });
+            });
+            // 卡片尾部迷你曲线：左侧三色图例 + 右侧 70% 宽趋势条
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let total_w = ui.available_width();
+            let bar_h = 18.0;
+            let spark_w = (total_w * 0.70).clamp(60.0, total_w);
+            let lang = self.lang;
+            let spec = [
+                (&hist.gt, SPARK_TEMP, 4.0, 0.04, 0.28),
+                (&hist.gf, SPARK_FAN, 100.0, 0.38, 0.62),
+                (&hist.gu, SPARK_LOAD, 5.0, 0.72, 0.96),
+            ];
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.allocate_ui_with_layout(
+                    egui::vec2((total_w - spark_w).max(0.0), bar_h),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        // 图例区宽度固定（曲线固定 70%）：英文文案更长时裁掉，避免压到曲线
+                        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
+                        spark_legend(ui, lang);
+                    },
+                );
+                sparkline(ui, bar_h, spark_w, &spec);
             });
         });
 
@@ -1303,7 +1391,7 @@ impl App {
             bottom_row(ui, |ui| {
                 ui.checkbox(&mut self.mask.mem, egui::RichText::new(T::Memory.t(self.lang)).size(12.0).strong());
                 // 间距由 item_spacing.x 提供，别再叠加 add_space（会变成 16px）
-                ui.label(egui::RichText::new(fmt(sample.mu, "%")).size(12.0).monospace().color(READOUT_GREEN));
+                readout_value(ui, &fmt(sample.mu, "%"), 30.0, 12.0);
             });
         });
 
@@ -1372,6 +1460,120 @@ fn bottom_row<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     .inner
 }
 
+/// 曲线颜色：温度红 / 负载绿 / 风扇青（深色主题下对比清晰）。
+const SPARK_TEMP: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x5B, 0x5B);
+const SPARK_LOAD: egui::Color32 = egui::Color32::from_rgb(0x4C, 0xE0, 0x70);
+const SPARK_FAN: egui::Color32 = egui::Color32::from_rgb(0x29, 0xB6, 0xF6);
+
+/// 在卡片底部画迷你趋势线（多色、上下错带、自适应量程、零依赖）。
+///
+/// `lines` 每项 = (环形缓冲, 颜色, 最小量程, 带顶比例, 带底比例)。
+/// - **自适应量程**：按该线自身 min/max 铺满所属带；`min_span` 抑制平稳期噪声放大。
+/// - **上下错带**：`band_top`/`band_bottom` 是 0..1 的垂直比例（0 = 顶），
+///   三条线各占一带、互不压叠，避免挤在同一条细带里糊成一团。
+/// - `NaN` 处断线（缺测不留假线）。
+/// - x 轴按**固定 HIST_CAP 点**映射，数据不足时曲线从右侧生长（最新点恒在最右）。
+fn sparkline(
+    ui: &mut egui::Ui,
+    height: f32,
+    width: f32,
+    lines: &[(&Ring, egui::Color32, f32, f32, f32)],
+) {
+    let w = width.min(ui.available_width()).max(1.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, height), egui::Sense::hover());
+    if rect.width() <= 1.0 || rect.height() <= 1.0 {
+        return;
+    }
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(0x1C, 0x1C, 0x1F));
+    let denom = (HIST_CAP - 1).max(1) as f32;
+    for (ring, color, min_span, band_top, band_bottom) in lines {
+        let n = ring.0.len();
+        if n < 2 {
+            continue;
+        }
+        // 自适应量程：只统计有限值（NaN 不参与 min/max）
+        let mut vmin = f32::INFINITY;
+        let mut vmax = f32::NEG_INFINITY;
+        for v in ring.0.iter() {
+            if v.is_finite() {
+                vmin = vmin.min(*v);
+                vmax = vmax.max(*v);
+            }
+        }
+        if !vmin.is_finite() || !vmax.is_finite() {
+            continue;
+        }
+        let span = (vmax - vmin).max(*min_span).max(1e-3);
+        let center = (vmax + vmin) * 0.5;
+        let btop = *band_top;
+        let bh = (*band_bottom - btop).clamp(0.02, 1.0);
+        let off = HIST_CAP.saturating_sub(n);
+        let stroke = egui::Stroke::new(1.2, *color);
+        let mut pts: Vec<egui::Pos2> = Vec::with_capacity(n);
+        for (i, v) in ring.0.iter().enumerate() {
+            let idx = off + i;
+            let x = rect.left() + rect.width() * (idx as f32 / denom);
+            if v.is_finite() {
+                let t = (0.5 + (*v - center) / span).clamp(0.0, 1.0); // 0 = 带底, 1 = 带顶
+                let frac = btop + (1.0 - t) * bh;                     // 垂直比例（0 = 顶）
+                pts.push(egui::pos2(x, rect.top() + rect.height() * frac));
+            } else {
+                if pts.len() >= 2 {
+                    painter.add(egui::Shape::line(std::mem::take(&mut pts), stroke));
+                } else {
+                    pts.clear();
+                }
+            }
+        }
+        if pts.len() >= 2 {
+            painter.add(egui::Shape::line(pts, stroke));
+        }
+    }
+}
+
+/// 曲线左侧的三色图例（温度 / 风扇 / 负载）——曲线只占卡片尾部，左端留白放它。
+fn spark_legend(ui: &mut egui::Ui, lang: Lang) {
+    for (color, text) in [
+        (SPARK_TEMP, T::Temp.t(lang)),
+        (SPARK_FAN, T::Fan.t(lang)),
+        (SPARK_LOAD, T::Load.t(lang)),
+    ] {
+        let (dot, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+        ui.painter().circle_filled(dot.center(), 3.0, color);
+        ui.label(egui::RichText::new(text).size(11.0).weak());
+        ui.add_space(6.0);
+    }
+}
+
+/// 固定宽度的读数数值。
+///
+/// ⚠⚠ 为什么必须固定宽度：egui 的 `Label` 宽度 = **文本实际宽度**。
+///   数值位数一变（`9%`→`10%`、`999`→`1012 RPM`、`—`→`54`），这个 label
+///   就变宽/变窄，把同一行后面的 checkbox 和数值**整体推开一格再拉回来**。
+///   采样 250ms 一次、风扇 RPM 低位又常抖 ⇒ 肉眼看到的就是"卡片里的字在晃"。
+///
+/// ⚠⚠⚠ 必须用 **`allocate_exact_size` + `painter.text`**：
+///   - 不能用裸 `ui.label`：宽度随文本变 ⇒ 数字位数一改，整行后移（"字在晃"）。
+///   - 不能用 `add_sized`：它内部是 `Layout::centered_and_justified`，**居中**对齐，
+///     数值在固定宽度里两边留白，看着离前面的标签老远（2026-10-28 用户反馈"距离太远"）。
+///   - 也不能用 `allocate_ui_with_layout`：`desired_size` 只是"最小建议"，会被内容撑大。
+///   自己 `allocate_exact_size` 拿精确矩形，再用 `Align2::LEFT_CENTER` 手绘 ⇒
+///   宽度钉死、文本紧贴左侧标签、垂直居中，三者同时满足。
+///
+/// 宽度按每列最长文本预留（温度 `100°C`、风扇 `2500 RPM`、百分比 `100%`）。
+fn readout_value(ui: &mut egui::Ui, text: &str, width: f32, size: f32) {
+    let h = ui.spacing().interact_size.y;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
+    ui.painter().text(
+        egui::pos2(rect.left(), rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::monospace(size),
+        READOUT_GREEN,
+    );
+}
+
 fn metric(ui: &mut egui::Ui, label: &str, value: &str, color: Option<egui::Color32>) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         // 用"本列可分到的宽度"，而不是外部传进来的固定值：
@@ -1404,6 +1606,7 @@ mod settings_tests {
             zoom: 1.25,
             rect: Some((240, 120, 1520, 840)),   // 物理像素外框：1280×720 @ (240,120)
             lang: Lang::Zh,
+            lhm_autostart: true,
         };
         want.save();
         assert_eq!(Settings::load(), want, "写进去的缩放/窗口大小要能原样读回");

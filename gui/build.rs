@@ -9,6 +9,15 @@
 //!
 //! DPI 感知不在这里声明：winit 启动时会自己调 `SetProcessDpiAwarenessContext`，
 //! egui 也能拿到正确的缩放比，不需要 manifest 里的 dpiAwareness 条目。
+//!
+//! ⚠ 为什么 `cargo test` 也会带上提权清单（2026-10-28 实测过一次，别再试）：
+//!   - build script 对一个 crate **只跑一次**，`cargo build` 与 `cargo test` 共用同一次运行；
+//!   - Cargo **不提供** `CARGO_CFG_TEST` 之类"这次是不是 --test"的信息；
+//!   - `cargo:rustc-link-arg-bin=ra6e2-monitor=...` 实测**仍会**作用到该 bin 的
+//!     单元测试 harness（Cargo 把它视为同一个 bin target，mode 只是 Test）
+//!     ⇒ 测试进程依旧 requireAdministrator，非管理员 shell 执行报 `os error 740`。
+//!   ⇒ 链接期无法按构建类型区分。跑单元测试请用 `scripts/test-gui.sh`
+//!     （内部 `RA6E2_NO_UAC=1 cargo test`，跑完再用默认配置重建带提权的 exe）。
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");

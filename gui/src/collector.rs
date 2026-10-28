@@ -72,7 +72,8 @@ pub enum FanUnit {
 impl FanUnit {
     pub fn suffix(self) -> &'static str {
         match self {
-            FanUnit::Rpm => "",
+            // ⚠ 2026-10-28 用户要求：RPM 也要显式带单位（原来返回 ""，界面上只剩裸数字）。
+            FanUnit::Rpm => " RPM",
             FanUnit::Percent => "%",
         }
     }
@@ -1215,6 +1216,7 @@ mod gpu_tests {
         assert_eq!(FanReading::percent(100.0).wire(), 2000);
         assert_eq!(FanReading::percent(150.0).wire(), 2000);   // 越界钳位
         assert_eq!(FanUnit::Percent.suffix(), "%");
-        assert_eq!(FanUnit::Rpm.suffix(), "");
+        // 2026-10-28：RPM 也带单位（原来返回 ""，界面上只有裸数字）
+        assert_eq!(FanUnit::Rpm.suffix(), " RPM");
     }
 }
