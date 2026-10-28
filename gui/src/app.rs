@@ -1203,6 +1203,50 @@ impl App {
         last_frame: &str,
         rate: f32,
     ) {
+        // 顶部信息条：选卡 + GPU 数据来源
+        // 2026-10-28 用户要求把「选卡 + 数据来源」提到中间区顶部，
+        // 并用淡绿高亮强调（仅 GPU 来源，语义与旧版一致）。
+        {
+            let (adapters, sel, src) = match self.shared.lock().ok() {
+                Some(s) => (s.gpu_adapters.clone(), s.gpu_selection, s.gpu_source),
+                None => (Vec::new(), 0usize, Source::LhmPdh),
+            };
+            if !adapters.is_empty() {
+                let names: Vec<String> = adapters
+                    .iter()
+                    .map(|a| {
+                        let tag = if a.software { " (软件)" } else { "" };
+                        format!("[{}] {}{}", a.vendor.name(), a.name, tag)
+                    })
+                    .collect();
+                let mut sel = sel.min(names.len().saturating_sub(1));
+
+                let strip = egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(10, 7))
+                    .fill(egui::Color32::from_rgb(30, 43, 30))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 130, 70)))
+                    .corner_radius(6.0);
+                strip.show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(T::GpuSelect.t(self.lang)).size(11.0).weak());
+                        egui::ComboBox::from_label("")
+                            .selected_text(names[sel].as_str())
+                            .show_index(ui, &mut sel, names.len(), |i| names[i].clone());
+                        ui.add_space(16.0);
+                        ui.label(
+                            egui::RichText::new(format!("{}: {}", T::Source.t(self.lang), src.label()))
+                                .size(11.0)
+                                .weak(),
+                        );
+                    });
+                });
+                if let Ok(mut s) = self.shared.lock() {
+                    s.gpu_selection = sel;
+                }
+            }
+        }
+
         ui.add_space(6.0);
         ui.label(egui::RichText::new(T::Telemetry.t(self.lang)).size(11.0).weak());
         ui.add_space(5.0);
@@ -1252,40 +1296,6 @@ impl App {
                 });
             });
         });
-
-        // Phase 4：选卡下拉 + 数据来源标签（多卡机器挑中独显；来源告诉用户数值来自哪家）
-        {
-            let (adapters, sel, src) = match self.shared.lock().ok() {
-                Some(s) => (s.gpu_adapters.clone(), s.gpu_selection, s.gpu_source),
-                None => (Vec::new(), 0usize, Source::LhmPdh),
-            };
-            if !adapters.is_empty() {
-                let names: Vec<String> = adapters
-                    .iter()
-                    .map(|a| {
-                        let tag = if a.software { " (软件)" } else { "" };
-                        format!("[{}] {}{}", a.vendor.name(), a.name, tag)
-                    })
-                    .collect();
-                let mut sel = sel.min(names.len().saturating_sub(1));
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(T::GpuSelect.t(self.lang)).size(11.0).weak());
-                    egui::ComboBox::from_label("")
-                        .selected_text(names[sel].as_str())
-                        .show_index(ui, &mut sel, names.len(), |i| names[i].clone());
-                });
-                if let Ok(mut s) = self.shared.lock() {
-                    s.gpu_selection = sel;
-                }
-                ui.label(
-                    egui::RichText::new(format!("{}: {}", T::Source.t(self.lang), src.label()))
-                        .size(11.0)
-                        .weak(),
-                );
-            }
-        }
-
 
         ui.add_space(6.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
