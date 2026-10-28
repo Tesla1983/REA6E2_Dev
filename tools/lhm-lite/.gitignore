@@ -1,0 +1,4 @@
+# 构建输出与 DLL 暂存（运行时用 gui/assets/lhm-lite.zip 分发，不进仓库）
+bin/
+obj/
+staging/

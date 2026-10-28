@@ -269,6 +269,7 @@ impl App {
             zoom: ctx.zoom_factor(),
             rect: prev.rect,
             lang,
+            lhm_autostart: prev.lhm_autostart,
         };
         if let Some(r) = Self::observed_rect(ctx) {
             st.rect = Some(r);
@@ -401,9 +402,12 @@ fn monitor(shared: Arc<Mutex<Shared>>, mask: Arc<Mutex<Mask>>, log: Sender<LogMs
 
     // LHM 没跑就没有温度/风扇（它要读 MSR/SuperIO 内核驱动）
     match crate::lhm::ensure_running() {
-        Ok(()) => say(LogMsg::LhmReady),
+        Ok(crate::lhm::LhmAction::AlreadyRunning) => say(LogMsg::LhmReady),
+        Ok(crate::lhm::LhmAction::Launched) => say(LogMsg::LhmLaunching),
         Err(e) => say(LogMsg::LhmUnavailable(e.to_string())),
     }
+    // 注意：**不**在这里管理开机自启计划任务——那完全由用户在「设置 → LHM 开机自启」
+    // 里主动勾选/取消来控制（默认关闭）。程序启动只负责按需拉起 LHM 进程。
 
     let mut cpu = CpuUsage::new();
     let mut gpu = GpuUsage::new();
@@ -425,7 +429,11 @@ fn monitor(shared: Arc<Mutex<Shared>>, mask: Arc<Mutex<Mask>>, log: Sender<LogMs
 
     // 已打开的串口（port 名 + 句柄）。None = 当前不发送。
     let mut open: Option<(String, board::RawSerial)> = None;
-    let period = Duration::from_millis(1000);
+    // 采样 250ms：让 CPU/GPU/温度/内存显示更实时（配合 lhm-lite 250ms 刷新）。
+    // 发帧仍限 1Hz：不改变发给开发板的帧率，固件侧协议/时序完全不动。
+    let period = Duration::from_millis(250);
+    let frame_period = Duration::from_millis(1000);
+    let mut last_send: Option<Instant> = None;
 
     loop {
         let tick = Instant::now();
@@ -494,12 +502,15 @@ fn monitor(shared: Arc<Mutex<Shared>>, mask: Arc<Mutex<Mask>>, log: Sender<LogMs
             }
         }
 
-        // 3) 有串口就发一帧
+        // 3) 有串口就发一帧（**发帧限 1Hz**：采样虽 250ms，但真正 write 给开发板的帧率
+        //    保持 1 帧/秒，固件侧协议、屏幕刷新节奏都不变）
         if let Some((port, ser)) = open.as_mut() {
+            let frame_due = last_send.map(|t| t.elapsed() >= frame_period).unwrap_or(true);
             let items = mask.lock().map(|m| m.items()).unwrap_or_default();
             let payload = board::build_payload(&sample, &items);
 
-            if !payload.is_empty() {
+            if frame_due && !payload.is_empty() {
+                last_send = Some(Instant::now());
                 let f = board::frame(&payload);
                 let mut ok = true;
                 if let Err(e) = ser.write_all(&f) {
@@ -546,7 +557,7 @@ fn monitor(shared: Arc<Mutex<Shared>>, mask: Arc<Mutex<Mask>>, log: Sender<LogMs
             sh.sample = sample;
         }
 
-        // 5) 睡到下一个整秒（切片睡，断开能及时响应）
+        // 5) 睡到下一个采样周期（250ms，切片睡，断开/改端口能及时响应）
         let spent = tick.elapsed();
         if spent < period {
             let left = period - spent;
@@ -708,6 +719,10 @@ pub struct Settings {
     pub rect: Option<(i32, i32, i32, i32)>,
     /// 界面语言。默认中文；顶栏按钮切换后落盘。
     pub lang: Lang,
+    /// LHM（温度/风扇数据源）是否开机自启。**默认关闭**——程序不会自动建任务，
+    /// 完全由用户在「设置 → LHM 开机自启」里勾选才创建（登录时以最高权限自启 LHM，
+    /// 把冷启动提前到开机，开上位机时数据零延迟）。
+    pub lhm_autostart: bool,
 }
 
 impl Default for Settings {
@@ -716,6 +731,7 @@ impl Default for Settings {
             zoom: 1.0,
             rect: None,
             lang: Lang::Zh,
+            lhm_autostart: false,
         }
     }
 }
@@ -754,6 +770,9 @@ impl Settings {
         if let Some(l) = v.get("lang").and_then(|x| x.as_u64()) {
             out.lang = Lang::from_u8(l as u8);
         }
+        if let Some(a) = v.get("lhm_autostart").and_then(|x| x.as_bool()) {
+            out.lhm_autostart = a;
+        }
         out
     }
 
@@ -767,6 +786,7 @@ impl Settings {
         let mut text = String::from("{");
         text.push_str(&format!("\"zoom\":{},", self.zoom));
         text.push_str(&format!("\"lang\":{}", self.lang.to_u8()));
+        text.push_str(&format!(", \"lhm_autostart\":{}", self.lhm_autostart));
         if let Some((l, t, r, b)) = self.rect {
             text.push_str(&format!(", \"rect\":[{l}, {t}, {r}, {b}]"));
         }
@@ -989,6 +1009,32 @@ impl App {
                             }
                         }
 
+                        ui.separator();
+                        let mut lhm_auto = self.pending.lhm_autostart;
+                        if ui
+                            .checkbox(&mut lhm_auto, T::LhmAutostart.t(self.lang))
+                            .on_hover_text(T::LhmAutostartHint.t(self.lang))
+                            .clicked()
+                        {
+                            match lhm_auto {
+                                true => {
+                                    if let Err(e) = crate::lhm::install_autostart() {
+                                        self.push_log(LogMsg::LhmUnavailable(format!(
+                                            "设置 LHM 开机自启失败: {e}"
+                                        )));
+                                    } else {
+                                        self.push_log(LogMsg::LhmAutostart(true));
+                                    }
+                                }
+                                false => {
+                                    let _ = crate::lhm::remove_autostart();
+                                    self.push_log(LogMsg::LhmAutostart(false));
+                                }
+                            }
+                            self.pending.lhm_autostart = lhm_auto;
+                            self.saved.lhm_autostart = lhm_auto;
+                            self.pending.save();
+                        }
                         ui.separator();
                         ui.label(
                             egui::RichText::new(format!("当前 {:.0}%", self.zoom * 100.0))

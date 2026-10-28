@@ -75,6 +75,8 @@ pub enum T {
     Sent,
     Fps,
     Timeouts,
+    LhmAutostart,
+    LhmAutostartHint,
 }
 
 impl T {
@@ -146,6 +148,14 @@ impl T {
             (T::Fps, Lang::En) => "FPS",
             (T::Timeouts, Lang::Zh) => "写超时",
             (T::Timeouts, Lang::En) => "Timeouts",
+            (T::LhmAutostart, Lang::Zh) => "LHM 开机自启",
+            (T::LhmAutostart, Lang::En) => "LHM autostart",
+            (T::LhmAutostartHint, Lang::Zh) => {
+                "默认关闭。勾选后以「计划任务」在登录时最高权限自启 LHM（温度/风扇数据源），开上位机零延迟；取消则删除任务"
+            }
+            (T::LhmAutostartHint, Lang::En) => {
+                "Off by default. Tick to create a scheduled task that launches LHM (temp/fan source) at logon with highest privileges, so data is ready instantly; untick to remove it"
+            }
         }
     }
 }
@@ -220,6 +230,8 @@ pub enum LogMsg {
     ToTray,
     LhmReady,
     LhmUnavailable(String),
+    LhmLaunching,
+    LhmAutostart(bool),
     PdhGpuUnavailable,
     SerialClosed(String),
     SerialOpened(String),
@@ -320,6 +332,26 @@ impl LogMsg {
             (LogMsg::LhmReady, Lang::En) => "LHM ready (sampling even without a board)".into(),
             (LogMsg::LhmUnavailable(e), Lang::Zh) => format!("LHM 不可用: {e}（温度/风扇会缺失）"),
             (LogMsg::LhmUnavailable(e), Lang::En) => format!("LHM unavailable: {e} (temp/fan missing)"),
+            (LogMsg::LhmLaunching, Lang::Zh) => {
+                "LHM 已拉起，等待就绪（温度/风扇稍后自动填充）".into()
+            }
+            (LogMsg::LhmLaunching, Lang::En) => {
+                "LHM launched, awaiting ready (temp/fan fill in shortly)".into()
+            }
+            (LogMsg::LhmAutostart(on), Lang::Zh) => {
+                if *on {
+                    "LHM 已设为开机自启（登录时以最高权限启动，温度/风扇零延迟）".into()
+                } else {
+                    "LHM 开机自启已关闭".into()
+                }
+            }
+            (LogMsg::LhmAutostart(on), Lang::En) => {
+                if *on {
+                    "LHM set to autostart at logon (highest privileges, instant data)".into()
+                } else {
+                    "LHM autostart disabled".into()
+                }
+            }
             (LogMsg::PdhGpuUnavailable, Lang::Zh) => {
                 "PDH 的 GPU Engine 计数器不可用，GPU 使用率将缺失".into()
             }
