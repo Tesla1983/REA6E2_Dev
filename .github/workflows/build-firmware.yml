@@ -91,16 +91,21 @@ jobs:
         with:
           workspaces: "gui"
 
-      - name: Build GUI release
-        run: cargo build --release
+      - name: Build GUI release (force MSVC target)
+        # 必须显式指定 MSVC target：某些 windows runner 默认 toolchain 是 GNU，
+        # 此时 build.rs 的 target_env=="msvc" 不成立会跳过 UAC 清单嵌入。
+        # 指定 target 后产物路径变为 target/<triple>/release/，下面路径要同步。
+        run: cargo build --release --target x86_64-pc-windows-msvc
         working-directory: gui
 
       - name: Verify UAC manifest embedded
         run: |
-          $bytes = [System.IO.File]::ReadAllBytes("gui/target/release/ra6e2-monitor.exe")
-          # 清单在 exe 里是 UTF-16LE（每个字符后跟 \0），必须用 Unicode 解码才能搜到
-          $s = [System.Text.Encoding]::Unicode.GetString($bytes)
-          if ($s.Contains("requireAdministrator")) {
+          $path = "gui/target/x86_64-pc-windows-msvc/release/ra6e2-monitor.exe"
+          $bytes = [System.IO.File]::ReadAllBytes($path)
+          # 清单可能以 UTF-8(ASCII) 或 UTF-16LE 存储，两种形态都搜一遍，避免编码假设误判
+          $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+          $utf16 = [System.Text.Encoding]::Unicode.GetString($bytes)
+          if ($ascii.Contains("requireAdministrator") -or $utf16.Contains("requireAdministrator")) {
             Write-Host "OK: requireAdministrator manifest present"
           } else {
             Write-Error "FAIL: requireAdministrator manifest missing"
@@ -112,7 +117,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gui-release
-          path: gui/target/release/ra6e2-monitor.exe
+          path: gui/target/x86_64-pc-windows-msvc/release/ra6e2-monitor.exe
           if-no-files-found: error
           retention-days: 90
 
