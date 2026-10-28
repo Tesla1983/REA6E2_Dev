@@ -1313,11 +1313,9 @@ impl App {
                     readout_value(ui, &fmt(sample.cf_display, sample.cf_unit.suffix()), 68.0, 14.0);
                 });
             });
-            // 卡片尾部迷你曲线：左侧三色图例 + 右侧 70% 宽趋势条
+            // 卡片尾部迷你曲线：图例按实际文字宽度自适应 + 曲线吃满剩余宽度（顶右缘）
             ui.spacing_mut().item_spacing.y = 0.0;
-            let total_w = ui.available_width();
             let bar_h = 18.0;
-            let spark_w = (total_w * 0.70).clamp(60.0, total_w);
             let lang = self.lang;
             let spec = [
                 (&hist.ct, SPARK_TEMP, 4.0, 0.04, 0.28),
@@ -1326,16 +1324,11 @@ impl App {
             ];
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                ui.allocate_ui_with_layout(
-                    egui::vec2((total_w - spark_w).max(0.0), bar_h),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        // 图例区宽度固定（曲线固定 70%）：英文文案更长时裁掉，避免压到曲线
-                        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
-                        spark_legend(ui, lang);
-                    },
-                );
-                sparkline(ui, bar_h, spark_w, &spec);
+                // 图例自然占内容宽度（中/英文各按自身文字宽度），不再固定预留 30%
+                spark_legend(ui, lang);
+                ui.add_space(2.0);
+                // 曲线吃满剩余宽度，保证顶到卡片右缘
+                sparkline(ui, bar_h, ui.available_width(), &spec);
             });
         });
 
@@ -1359,11 +1352,9 @@ impl App {
                     readout_value(ui, &fmt(sample.gv, "%"), 34.0, 14.0);
                 });
             });
-            // 卡片尾部迷你曲线：左侧三色图例 + 右侧 70% 宽趋势条
+            // 卡片尾部迷你曲线：图例按实际文字宽度自适应 + 曲线吃满剩余宽度（顶右缘）
             ui.spacing_mut().item_spacing.y = 0.0;
-            let total_w = ui.available_width();
             let bar_h = 18.0;
-            let spark_w = (total_w * 0.70).clamp(60.0, total_w);
             let lang = self.lang;
             let spec = [
                 (&hist.gt, SPARK_TEMP, 4.0, 0.04, 0.28),
@@ -1372,16 +1363,11 @@ impl App {
             ];
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                ui.allocate_ui_with_layout(
-                    egui::vec2((total_w - spark_w).max(0.0), bar_h),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        // 图例区宽度固定（曲线固定 70%）：英文文案更长时裁掉，避免压到曲线
-                        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
-                        spark_legend(ui, lang);
-                    },
-                );
-                sparkline(ui, bar_h, spark_w, &spec);
+                // 图例自然占内容宽度（中/英文各按自身文字宽度），不再固定预留 30%
+                spark_legend(ui, lang);
+                ui.add_space(2.0);
+                // 曲线吃满剩余宽度，保证顶到卡片右缘
+                sparkline(ui, bar_h, ui.available_width(), &spec);
             });
         });
 
