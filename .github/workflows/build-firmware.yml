@@ -98,7 +98,8 @@ jobs:
       - name: Verify UAC manifest embedded
         run: |
           $bytes = [System.IO.File]::ReadAllBytes("gui/target/release/ra6e2-monitor.exe")
-          $s = [System.Text.Encoding]::ASCII.GetString($bytes)
+          # 清单在 exe 里是 UTF-16LE（每个字符后跟 \0），必须用 Unicode 解码才能搜到
+          $s = [System.Text.Encoding]::Unicode.GetString($bytes)
           if ($s.Contains("requireAdministrator")) {
             Write-Host "OK: requireAdministrator manifest present"
           } else {
