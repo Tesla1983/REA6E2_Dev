@@ -1,4 +1,4 @@
-name: Build RA6E2 Firmware
+name: Build RA6E2 Firmware & GUI
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: ci-firmware-${{ github.ref }}
+  group: ci-ra6e2-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -71,11 +71,55 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  # 上位机 GUI：必须在 Windows (MSVC) 上编译——依赖 windows crate 且 build.rs 用
+  # /MANIFESTUAC 嵌入管理员提权清单，只能在 x86_64-pc-windows-msvc 下链接生效。
+  build-gui:
+    name: Build GUI (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "gui"
+
+      - name: Build GUI release
+        run: cargo build --release
+        working-directory: gui
+
+      - name: Verify UAC manifest embedded
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes("gui/target/release/ra6e2-monitor.exe")
+          $s = [System.Text.Encoding]::ASCII.GetString($bytes)
+          if ($s.Contains("requireAdministrator")) {
+            Write-Host "OK: requireAdministrator manifest present"
+          } else {
+            Write-Error "FAIL: requireAdministrator manifest missing"
+            exit 1
+          }
+
+      - name: Upload GUI artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-release
+          path: gui/target/release/ra6e2-monitor.exe
+          if-no-files-found: error
+          retention-days: 90
+
   release:
-    name: Publish firmware release
-    # 仅当推送版本标签(v*)时发布; 取 Release 矩阵产物作为公开下载固件
+    name: Publish release
+    # 仅当推送版本标签(v*)时发布; 取 Release 矩阵产物 + 上位机 exe 作为公开下载内容
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, build-gui]
     runs-on: ubuntu-24.04
     steps:
       - name: Download Release firmware artifacts
@@ -84,25 +128,34 @@ jobs:
           name: firmware-Release
           path: release-artifacts
 
+      - name: Download GUI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gui-release
+          path: gui-artifacts
+
       - name: Draft release notes (构建信息)
         run: |
           {
-            echo "## RA6E2 固件构建信息"
+            echo "## RA6E2 固件 + 上位机构建信息"
             echo ""
             echo "- 提交: \`${{ github.sha }}\`"
             echo "- 标签: \`${{ github.ref_name }}\`"
-            echo "- 工具链: \`$(arm-none-eabi-gcc --version | head -1)\`"
-            echo "- 目标: Renesas RA6E2 (R7FA6E2BB, Cortex-M33)"
+            echo "- 固件工具链: \`$(arm-none-eabi-gcc --version | head -1)\`"
             echo ""
-            echo "### 下载"
+            echo "### 固件下载"
             echo "- \`ra6e2_fw.bin\` —— 裸镜像, 烧录工具/上位机直接用"
             echo "- \`ra6e2_fw.hex\` —— Intel HEX, 通用编程器"
             echo "- \`ra6e2_fw.elf\` —— 含调试符号"
             echo "- \`ra6e2_fw.map\` / \`ra6e2_fw.srec\` —— 链接映射 / Motorola S-record"
             echo ""
+            echo "### 上位机 (Windows)"
+            echo "- \`ra6e2-monitor.exe\` —— 上位机 GUI（需**管理员运行**以读取 CPU 温度/风扇，已内嵌 UAC 提权清单）"
+            echo ""
             echo "### 校验和"
             echo '```'
             sha256sum release-artifacts/ra6e2_fw.bin
+            sha256sum gui-artifacts/ra6e2-monitor.exe
             echo '```'
           } > release_notes.md
           cat release_notes.md
@@ -116,6 +169,7 @@ jobs:
             release-artifacts/ra6e2_fw.bin
             release-artifacts/ra6e2_fw.srec
             release-artifacts/ra6e2_fw.map
+            gui-artifacts/ra6e2-monitor.exe
           body_path: release_notes.md
           generate_release_notes: true
           make_latest: true
