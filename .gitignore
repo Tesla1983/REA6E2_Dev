@@ -30,3 +30,6 @@ __pycache__/
 # ===== 本地开发文档与配图（不进仓库，仅本地参考；docs/立创地奇星RA6E2/ 仍跟踪）=====
 docs/*.md
 docs/assets/
+
+# ===== GUI 设计稿（本地预览，不进仓库）=====
+gui/gauge_zones_preview.html

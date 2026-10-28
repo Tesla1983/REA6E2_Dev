@@ -79,6 +79,10 @@ pub enum T {
     LhmAutostartHint,
     Theme,
     DarkBg,
+    CpuTempThresholds,
+    GpuTempThresholds,
+    TempWarn,
+    TempCrit,
 }
 
 impl T {
@@ -162,6 +166,14 @@ impl T {
             (T::Theme, Lang::En) => "Theme",
             (T::DarkBg, Lang::Zh) => "深色背景",
             (T::DarkBg, Lang::En) => "Dark background",
+            (T::CpuTempThresholds, Lang::Zh) => "CPU 温度阈值",
+            (T::CpuTempThresholds, Lang::En) => "CPU temp thresholds",
+            (T::GpuTempThresholds, Lang::Zh) => "GPU 温度阈值",
+            (T::GpuTempThresholds, Lang::En) => "GPU temp thresholds",
+            (T::TempWarn, Lang::Zh) => "接近极限",
+            (T::TempWarn, Lang::En) => "Near limit",
+            (T::TempCrit, Lang::Zh) => "超过极限",
+            (T::TempCrit, Lang::En) => "Over limit",
         }
     }
 }

@@ -299,6 +299,10 @@ impl App {
             lang,
             lhm_autostart: prev.lhm_autostart,
             theme: prev.theme,
+            cpu_temp_warn: prev.cpu_temp_warn,
+            cpu_temp_crit: prev.cpu_temp_crit,
+            gpu_temp_warn: prev.gpu_temp_warn,
+            gpu_temp_crit: prev.gpu_temp_crit,
         };
         if let Some(r) = Self::observed_rect(ctx) {
             st.rect = Some(r);
@@ -833,6 +837,12 @@ pub struct Settings {
     pub lhm_autostart: bool,
     /// 界面主题。**默认深色**（与改之前一致）。`Light` = 正常/浅色背景。
     pub theme: Theme,
+    /// 表盘温度阈值（°C）：≥ warn 进黄区、≥ crit 进红区。**CPU / GPU 各一组**，
+    /// 默认都是 60 / 80，可在「设置 → 表盘温度阈值」里分别修改并持久化。
+    pub cpu_temp_warn: f32,
+    pub cpu_temp_crit: f32,
+    pub gpu_temp_warn: f32,
+    pub gpu_temp_crit: f32,
 }
 
 impl Default for Settings {
@@ -843,8 +853,42 @@ impl Default for Settings {
             lang: Lang::Zh,
             lhm_autostart: false,
             theme: Theme::Dark,
+            cpu_temp_warn: 60.0,
+            cpu_temp_crit: 80.0,
+            gpu_temp_warn: 60.0,
+            gpu_temp_crit: 80.0,
         }
     }
+}
+
+/// 设置菜单里的一个温度阈值输入行（标签 + DragValue）；返回是否被修改。
+fn thr_row(ui: &mut egui::Ui, label: &str, v: &mut f32) -> bool {
+    let mut ch = false;
+    ui.horizontal(|ui| {
+        // 定宽标签：CPU / GPU 两组的输入框才能左右对齐
+        ui.add_sized(
+            egui::vec2(58.0, 16.0),
+            egui::Label::new(egui::RichText::new(label).size(11.0)),
+        );
+        ch = ui
+            .add(
+                egui::DragValue::new(v)
+                    .range(1.0..=150.0)
+                    .max_decimals(0)
+                    .speed(1.0)
+                    .suffix(" °C"),
+            )
+            .changed();
+    });
+    ch
+}
+
+/// 夹取一组温度阈值 `(warn, crit)`：范围 1..=150，且保证 `warn < crit`（至少差 1°C）。
+fn clamp_pair(w: f32, c: f32) -> (f32, f32) {
+    let c = c.clamp(2.0, 150.0);
+    let w = w.clamp(1.0, 149.0);
+    let w = if w >= c { (c - 1.0).max(1.0) } else { w };
+    (w, c)
 }
 
 impl Settings {
@@ -887,6 +931,38 @@ impl Settings {
         if let Some(t) = v.get("theme").and_then(|x| x.as_u64()) {
             out.theme = if t == 1 { Theme::Light } else { Theme::Dark };
         }
+        // 兼容旧版单组阈值（temp_warn / temp_crit）：先当作 CPU、GPU 的共同初值，
+        // 再让分组字段（cpu_temp_* / gpu_temp_*）覆盖各自的值。
+        if let Some(w) = v.get("temp_warn").and_then(|x| x.as_f64()) {
+            if (1.0..=150.0).contains(&w) {
+                out.cpu_temp_warn = w as f32;
+                out.gpu_temp_warn = w as f32;
+            }
+        }
+        if let Some(c) = v.get("temp_crit").and_then(|x| x.as_f64()) {
+            if (1.0..=150.0).contains(&c) {
+                out.cpu_temp_crit = c as f32;
+                out.gpu_temp_crit = c as f32;
+            }
+        }
+        let rd = |key: &str, dst: &mut f32| {
+            if let Some(x) = v.get(key).and_then(|x| x.as_f64()) {
+                if (1.0..=150.0).contains(&x) {
+                    *dst = x as f32;
+                }
+            }
+        };
+        rd("cpu_temp_warn", &mut out.cpu_temp_warn);
+        rd("cpu_temp_crit", &mut out.cpu_temp_crit);
+        rd("gpu_temp_warn", &mut out.gpu_temp_warn);
+        rd("gpu_temp_crit", &mut out.gpu_temp_crit);
+        // 配置被手改坏时兜底：保证 warn < crit（否则黄区宽度为负）
+        let (cw, cc) = clamp_pair(out.cpu_temp_warn, out.cpu_temp_crit);
+        out.cpu_temp_warn = cw;
+        out.cpu_temp_crit = cc;
+        let (gw, gc) = clamp_pair(out.gpu_temp_warn, out.gpu_temp_crit);
+        out.gpu_temp_warn = gw;
+        out.gpu_temp_crit = gc;
         out
     }
 
@@ -904,6 +980,10 @@ impl Settings {
         text.push_str(&format!(
             ", \"theme\":{}",
             if self.theme.is_dark() { 0 } else { 1 }
+        ));
+        text.push_str(&format!(
+            ", \"cpu_temp_warn\":{}, \"cpu_temp_crit\":{}, \"gpu_temp_warn\":{}, \"gpu_temp_crit\":{}",
+            self.cpu_temp_warn, self.cpu_temp_crit, self.gpu_temp_warn, self.gpu_temp_crit
         ));
         if let Some((l, t, r, b)) = self.rect {
             text.push_str(&format!(", \"rect\":[{l}, {t}, {r}, {b}]"));
@@ -1175,6 +1255,43 @@ impl App {
                             self.pending.save();
                         }
                         ui.separator();
+                        // 表盘温度阈值（CPU / GPU 各一组）：≥ warn 黄、≥ crit 红，即时生效并落盘
+                        ui.label(
+                            egui::RichText::new(T::CpuTempThresholds.t(self.lang))
+                                .size(11.0)
+                                .weak(),
+                        );
+                        let (mut cw, mut cc) =
+                            (self.pending.cpu_temp_warn, self.pending.cpu_temp_crit);
+                        let mut ch = thr_row(ui, T::TempWarn.t(self.lang), &mut cw);
+                        ch |= thr_row(ui, T::TempCrit.t(self.lang), &mut cc);
+                        if ch {
+                            let (w, c) = clamp_pair(cw, cc);
+                            self.pending.cpu_temp_warn = w;
+                            self.pending.cpu_temp_crit = c;
+                            self.saved.cpu_temp_warn = w;
+                            self.saved.cpu_temp_crit = c;
+                            self.pending.save();
+                        }
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(T::GpuTempThresholds.t(self.lang))
+                                .size(11.0)
+                                .weak(),
+                        );
+                        let (mut gw, mut gc) =
+                            (self.pending.gpu_temp_warn, self.pending.gpu_temp_crit);
+                        let mut ch2 = thr_row(ui, T::TempWarn.t(self.lang), &mut gw);
+                        ch2 |= thr_row(ui, T::TempCrit.t(self.lang), &mut gc);
+                        if ch2 {
+                            let (w, c) = clamp_pair(gw, gc);
+                            self.pending.gpu_temp_warn = w;
+                            self.pending.gpu_temp_crit = c;
+                            self.saved.gpu_temp_warn = w;
+                            self.saved.gpu_temp_crit = c;
+                            self.pending.save();
+                        }
+                        ui.separator();
                         ui.label(
                             egui::RichText::new(format!("当前 {:.0}%", self.zoom * 100.0))
                                 .size(11.0)
@@ -1419,7 +1536,8 @@ impl App {
                     "°C",
                     anim("g_cpu_temp", sample.ct),
                     100.0,
-                    gauge::TEMP_COLOR,
+                    self.pending.cpu_temp_warn,
+                    self.pending.cpu_temp_crit,
                     self.mask.cpu_temp,
                 )
                 .clicked();
@@ -1429,18 +1547,21 @@ impl App {
                     "%",
                     anim("g_cpu_load", sample.cu),
                     100.0,
-                    gauge::LOAD_COLOR,
+                    70.0,
+                    90.0,
                     self.mask.cpu_load,
                 )
                 .clicked();
                 let cpu_fan_max = fan_max(sample.cf_unit);
+                let (cpu_fan_warn, cpu_fan_crit) = fan_limits(sample.cf_unit);
                 c_fan = gauge::gauge(
                     &mut cols[2],
                     T::Fan.t(self.lang),
                     sample.cf_unit.suffix(),
                     anim("g_cpu_fan", sample.cf_display),
                     cpu_fan_max,
-                    gauge::FAN_COLOR,
+                    cpu_fan_warn,
+                    cpu_fan_crit,
                     self.mask.cpu_fan,
                 )
                 .clicked();
@@ -1476,7 +1597,8 @@ impl App {
                     "°C",
                     anim("g_gpu_temp", sample.gt),
                     100.0,
-                    gauge::TEMP_COLOR,
+                    self.pending.gpu_temp_warn,
+                    self.pending.gpu_temp_crit,
                     self.mask.gpu_temp,
                 )
                 .clicked();
@@ -1486,18 +1608,21 @@ impl App {
                     "%",
                     anim("g_gpu_load", sample.gu),
                     100.0,
-                    gauge::LOAD_COLOR,
+                    70.0,
+                    90.0,
                     self.mask.gpu_load,
                 )
                 .clicked();
                 let gpu_fan_max = fan_max(sample.gf_unit);
+                let (gpu_fan_warn, gpu_fan_crit) = fan_limits(sample.gf_unit);
                 g_fan = gauge::gauge(
                     &mut cols[2],
                     T::Fan.t(self.lang),
                     sample.gf_unit.suffix(),
                     anim("g_gpu_fan", sample.gf_display),
                     gpu_fan_max,
-                    gauge::FAN_COLOR,
+                    gpu_fan_warn,
+                    gpu_fan_crit,
                     self.mask.gpu_fan,
                 )
                 .clicked();
@@ -1507,7 +1632,8 @@ impl App {
                     "%",
                     anim("g_gpu_vram", sample.gv),
                     100.0,
-                    gauge::MEM_COLOR,
+                    70.0,
+                    90.0,
                     self.mask.gpu_vram,
                 )
                 .clicked();
@@ -1531,7 +1657,7 @@ impl App {
             ui.set_width(ui.available_width());
             ui.checkbox(
                 &mut self.mask.mem,
-                egui::RichText::new(T::Memory.t(self.lang)).size(13.0).strong().color(gauge::MEM_COLOR),
+                egui::RichText::new(T::Memory.t(self.lang)).size(13.0).strong().color(gauge::MEM_TITLE),
             );
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
@@ -1542,7 +1668,8 @@ impl App {
                     "%",
                     anim("g_mem", sample.mu),
                     100.0,
-                    gauge::MEM_COLOR,
+                    70.0,
+                    90.0,
                     self.mask.mem,
                 )
                 .clicked()
@@ -1613,6 +1740,15 @@ fn fan_max(u: crate::collector::FanUnit) -> f32 {
     match u {
         crate::collector::FanUnit::Rpm => 3000.0,
         crate::collector::FanUnit::Percent => 100.0,
+    }
+}
+
+/// 风扇三段色阈值（绝对单位，与 `fan_max` 同单位）：
+/// RPM 机型 1800/2600 转进黄/红；只有百分比时 70/90 %。
+fn fan_limits(u: crate::collector::FanUnit) -> (f32, f32) {
+    match u {
+        crate::collector::FanUnit::Rpm => (1800.0, 2600.0),
+        crate::collector::FanUnit::Percent => (70.0, 90.0),
     }
 }
 
@@ -1781,6 +1917,10 @@ mod settings_tests {
             lang: Lang::Zh,
             lhm_autostart: true,
             theme: Theme::Dark,
+            cpu_temp_warn: 55.0,
+            cpu_temp_crit: 75.0,
+            gpu_temp_warn: 65.0,
+            gpu_temp_crit: 85.0,
         };
         want.save();
         assert_eq!(Settings::load(), want, "写进去的缩放/窗口大小要能原样读回");
