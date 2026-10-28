@@ -861,7 +861,9 @@ impl Default for Settings {
     }
 }
 
-/// 设置菜单里的一个温度阈值输入行（标签 + DragValue）；返回是否被修改。
+/// 设置菜单里的一个温度阈值输入行：
+/// 标签 + 数字框（点击可直接输入、可拖动）+ 右侧上下小三角步进按钮；返回是否被修改。
+/// 三角形按住可连发，步长 1°C；越界由调用方 `clamp_pair` 统一钳制。
 fn thr_row(ui: &mut egui::Ui, label: &str, v: &mut f32) -> bool {
     let mut ch = false;
     ui.horizontal(|ui| {
@@ -870,15 +872,37 @@ fn thr_row(ui: &mut egui::Ui, label: &str, v: &mut f32) -> bool {
             egui::vec2(58.0, 16.0),
             egui::Label::new(egui::RichText::new(label).size(11.0)),
         );
-        ch = ui
-            .add(
-                egui::DragValue::new(v)
-                    .range(1.0..=150.0)
-                    .max_decimals(0)
-                    .speed(1.0)
-                    .suffix(" °C"),
-            )
-            .changed();
+        // 数字框：DragValue 既支持左右拖动调值，也支持点击后直接键盘输入
+        let dv = ui.add_sized(
+            egui::vec2(38.0, 18.0),
+            egui::DragValue::new(v)
+                .range(1.0..=150.0)
+                .max_decimals(0)
+                .speed(1.0),
+        );
+        ch |= dv.changed();
+        // 右侧上下小三角步进（每点一次 ±1°C）；frame(false) 去掉按钮边框，看着像原生数字框的微调钮
+        ui.vertical(|ui| {
+            let up = ui.add(
+                egui::Button::new(egui::RichText::new("▲").size(7.0))
+                    .small()
+                    .frame(false),
+            );
+            let dn = ui.add(
+                egui::Button::new(egui::RichText::new("▼").size(7.0))
+                    .small()
+                    .frame(false),
+            );
+            if up.clicked() {
+                *v = (*v + 1.0).clamp(1.0, 150.0);
+                ch = true;
+            }
+            if dn.clicked() {
+                *v = (*v - 1.0).clamp(1.0, 150.0);
+                ch = true;
+            }
+        });
+        ui.label(egui::RichText::new("°C").size(10.0).weak());
     });
     ch
 }
@@ -1191,7 +1215,12 @@ impl App {
                 ui.label(egui::RichText::new("v1.0.0").size(11.0).weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // right_to_left 布局：先加的在上层（最右），所以"设置"在最右边
-                    ui.menu_button(T::Settings.t(self.lang), |ui| {
+                    egui::menu::MenuButton::new(T::Settings.t(self.lang))
+                        .config(
+                            egui::menu::MenuConfig::default()
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                        )
+                        .ui(ui, |ui| {
                         ui.set_min_width(190.0);
                         ui.label(egui::RichText::new(T::FontSize.t(self.lang)).size(11.0).weak());
                         ui.add_space(4.0);
@@ -1306,6 +1335,7 @@ impl App {
                         self.lang = self.lang.toggle();
                         self.pending.lang = self.lang;
                         self.last_change = Some(Instant::now());
+                        ui.close();
                     }
                     ui.label(egui::RichText::new(txt).size(12.0).color(dot));
                 });
