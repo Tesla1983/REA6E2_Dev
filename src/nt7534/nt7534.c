@@ -356,6 +356,67 @@ static void draw_cell(u8g2_t * g, const char * s,
     u8g2_DrawUTF8(g, (u8g2_uint_t) x, (u8g2_uint_t) y, s);
 }
 
+/* ===== 中文点阵（16x15，宋体，2026-10-28）=====
+ * 屏状态行只有 15 px 高（y48..62），故用 16x15 点阵放「已连接 / 未连接」。
+ * 每字 15 个 uint16_t：bit15 = 最左列（col0），bit0 = 第 16 列。
+ * 由系统字体渲染生成（simsun, size=15, 阈值 100, 墨迹居中贴格），只含本需求 4 个字
+ * （已 / 连 / 接 / 未），共 4×30 = 120 B。
+ * ⚠ 仅 u8g2 路径（U8G2_PORT_ENABLE=1）使用；旧 NT7534_DrawString 路径不支持中文。 */
+static const uint16_t g_zh_yi[15] = {
+    0x0000u, 0x3FF8u, 0x0008u, 0x0008u, 0x2008u, 0x2008u, 0x3FF8u, 0x2000u, 0x2000u, 0x2000u, 0x2000u, 0x2004u, 0x2004u, 0x1FFCu, 0x0000u
+};
+static const uint16_t g_zh_lian[15] = {
+    0x0080u, 0x2080u, 0x17F8u, 0x1100u, 0x0240u, 0x0240u, 0x77F8u, 0x1040u, 0x1040u, 0x17FCu, 0x1040u, 0x1040u, 0x2840u, 0x47FCu, 0x0000u
+};
+static const uint16_t g_zh_jie[15] = {
+    0x1080u, 0x1040u, 0x13F8u, 0x7D10u, 0x10A0u, 0x17FCu, 0x1080u, 0x1880u, 0x77FCu, 0x1110u, 0x1320u, 0x10C0u, 0x1130u, 0x7608u, 0x0000u
+};
+static const uint16_t g_zh_wei[15] = {
+    0x0100u, 0x0100u, 0x3FF8u, 0x0100u, 0x0100u, 0x0100u, 0x7FFCu, 0x0380u, 0x0540u, 0x0920u, 0x1110u, 0x610Cu, 0x0100u, 0x0100u, 0x0000u
+};
+
+/** 画一个 16x15 汉字点阵（bit15 = 最左列），逐点置位。
+ *  当前 FontMode = 1（透明）⇒ 只置位、不清背景，不会擦断表格线。 */
+static void draw_zh15(u8g2_t * g, const uint16_t * glyph, int16_t x, int16_t y)
+{
+    int row;
+    int col;
+
+    for (row = 0; row < 15; row++)
+    {
+        uint16_t bits = glyph[row];
+
+        for (col = 0; col < 16; col++)
+        {
+            if (0u != (bits & (uint16_t) (0x8000u >> col)))
+            {
+                u8g2_DrawPixel(g, (u8g2_uint_t) (x + col), (u8g2_uint_t) (y + row));
+            }
+        }
+    }
+}
+
+/** 状态行：按 g_screen_lang 选中/英文。
+ *  中文「已连接 / 未连接」= 3 字 × 16 px = 48 px，居中于 x1..53（宽 53）、y48..62（高 15）；
+ *  英文仍走原 draw_cell（7x13），行为与之前完全一致。 */
+static void draw_status_cell(u8g2_t * g)
+{
+    if (0u == g_screen_lang)
+    {
+        draw_cell(g, UART_Link_Online() ? "linked" : "unlink", 1, 53, 48, 62);
+        return;
+    }
+
+    {
+        const uint16_t * first = UART_Link_Online() ? g_zh_yi : g_zh_wei;
+        int16_t          x     = (int16_t) (1 + (53 - 48) / 2);   /* = 3 */
+
+        draw_zh15(g, first,     x, 48);
+        draw_zh15(g, g_zh_lian, (int16_t) (x + 16), 48);
+        draw_zh15(g, g_zh_jie,  (int16_t) (x + 32), 48);
+    }
+}
+
 /** 自绘 5x7 小字(仅 C/P/U/G), 用于风扇格标签——比 7x13 小, 放得下且不压线。
  *  每个字形 7 行, 每行低 5 位有效(bit4 在左)。纯置位绘制, 不清背景。 */
 static const uint8_t g_glyph_C[7] = { 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E };
@@ -504,7 +565,7 @@ static void draw_layout_a(void)
     draw_cell(g, s, 25, 53, 33, 46);
 
     /* --- 状态行(独占 x0..54, 不被竖线穿过) --- */
-    draw_cell(g, UART_Link_Online() ? "linked" : "unlink", 1, 53, 48, 62);
+    draw_status_cell(g);
 
     /* --- 右下角风扇格: 顶部 5x7 小字标签(y34, 离横线2px/离风扇2px) + 20x20 风扇 --- */
     draw_small_label(g, "CPU", 55, 85, 34);

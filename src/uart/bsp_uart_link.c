@@ -22,6 +22,12 @@ volatile uint8_t  g_link_last[40]  = { 0u };
 volatile int32_t  g_link_tx_err   = 0;   /* 最近一次 beacon write 的返回码（0=成功）*/
 volatile uint32_t g_link_tx_cnt   = 0u;  /* beacon 已发起次数 */
 
+/** 屏显示语言：0 = 英文（linked / unlink），1 = 中文（已连接 / 未连接）。
+ *  **默认 1（中文）**，与上位机默认语言一致（2026-10-28 用户确定）。
+ *  ⚠ 不能放进 s_data：link_data_clear() 在每帧解析前和断链时都会清 s_data，
+ *    语言若在其中会被清掉，断链后状态行会退回英文。这里只在下发 LG 时更新。 */
+volatile uint8_t g_screen_lang = 1u;
+
 /* ---------------- 环形缓冲（单生产者 / 单消费者）---------------- */
 /* 生产者 = 串口中断（只写 s_head），消费者 = 主循环（只写 s_tail）。
  * 256 字节: 一帧最长 60 字节左右, 够缓冲 4 帧, 主循环 250 ms 必被调一次。 */
@@ -143,6 +149,11 @@ static void store_field(const uint8_t * p_key, const uint8_t * p_val, uint16_t v
     else if ((uint8_t) 'M' == p_key[0])
     {
         if ((uint8_t) 'U' == p_key[1]) { s_data.mu = v; return; }
+    }
+    else if ((uint8_t) 'L' == p_key[0])
+    {
+        /* LG: 屏显示语言（1=中文 / 0=英文），写独立全局变量, 不进 s_data。 */
+        if ((uint8_t) 'G' == p_key[1]) { g_screen_lang = (0 != v) ? 1u : 0u; return; }
     }
 
     /* 未定义的 key: 忽略（上位机将来加字段不会让本固件出错） */

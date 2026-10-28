@@ -42,6 +42,10 @@ extern volatile uint8_t  g_link_last[40];  /* 最后一次被丢弃的原始行�
 extern volatile int32_t  g_link_tx_err;    /* beacon write 的返回码（0=成功） */
 extern volatile uint32_t g_link_tx_cnt;    /* beacon 已发起次数 */
 
+/** 屏显示语言（0=英文 linked/unlink，1=中文 已连接/未连接）。
+ *  由上位机数据行的 `LG` 字段下发；默认 1（中文）。 */
+extern volatile uint8_t  g_screen_lang;
+
 /** 打开 SCI0 并挂上单字节接收。返回 FSP_SUCCESS 表示成功。 */
 fsp_err_t UART_Link_Init(void);
 

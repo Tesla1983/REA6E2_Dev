@@ -66,6 +66,9 @@ struct Shared {
     gpu_selection_applied: usize,
     /// CPU/GPU 曲线历史（监控线程写，UI 每帧取快照）。
     hist: History,
+    /// 界面语言（UI 写，监控线程读）：监控线程每帧把它作为 `LG:0/1` 字段下发，
+    /// 固件据此切换 3.5" 屏「已连接 / linked」的措辞。默认中文。
+    lang: Lang,
 }
 
 /// 勾选状态。组开关关掉时，组内细项灰掉且不生效。
@@ -533,9 +536,20 @@ fn monitor(shared: Arc<Mutex<Shared>>, mask: Arc<Mutex<Mask>>, log: Sender<LogMs
         if let Some((port, ser)) = open.as_mut() {
             let frame_due = last_send.map(|t| t.elapsed() >= frame_period).unwrap_or(true);
             let items = mask.lock().map(|m| m.items()).unwrap_or_default();
-            let payload = board::build_payload(&sample, &items);
+            let mut payload = board::build_payload(&sample, &items);
+            // 语言字段：无论有没有勾指标都要下发（`LG:1`=中文 / `LG:0`=英文），
+            // 固件据此切换 3.5" 屏状态行措辞。旧固件对未知 key 直接忽略，向后兼容。
+            let lg = if shared.lock().ok().map(|s| s.lang).unwrap_or_default() == Lang::Zh {
+                1
+            } else {
+                0
+            };
+            if !payload.is_empty() {
+                payload.push(',');
+            }
+            payload.push_str(if lg == 1 { "LG:1" } else { "LG:0" });
 
-            if frame_due && !payload.is_empty() {
+            if frame_due {
                 last_send = Some(Instant::now());
                 let f = board::frame(&payload);
                 let mut ok = true;
@@ -987,6 +1001,10 @@ impl eframe::App for App {
         // 把 UI 上的勾选同步给工作线程
         if let Ok(mut m) = self.mask_shared.lock() {
             *m = self.mask;
+        }
+        // 把界面语言同步给监控线程（它每帧把语言作为 LG 字段下发，屏据此切中英文）
+        if let Ok(mut s) = self.shared.lock() {
+            s.lang = self.lang;
         }
 
         while let Ok(msg) = self.log_rx.try_recv() {
