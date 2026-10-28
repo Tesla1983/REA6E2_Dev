@@ -10,6 +10,7 @@ use eframe::egui;
 
 use crate::board::{self, Board};
 use crate::collector::{self, CpuUsage, GpuUsage, Sample};
+use crate::gauge;
 use crate::gpu::{AdapterKey, Source};
 use crate::i18n::{status_text, Lang, LogMsg, T};
 
@@ -172,17 +173,10 @@ impl App {
         let font_note = install_fonts(&cc.egui_ctx);
         let (log_tx, log_rx) = channel();
 
-        // 明确用深色主题 + 自己调过的配色：
-        //   · 避免跟随系统浅色主题时，首帧出现一次"亮 → 暗"的切换闪
-        //   · 把默认偏暗的灰调亮（用户反馈灰色看着不舒服）
-        // ⚠ egui 0.37 的 ThemePreference 默认是 **System**：系统一旦切到浅色主题，
-        //   它会用浅色 visuals 覆盖掉 build_visuals() 设的深色（实测过整窗变白）。
-        //   ⇒ 先钉死 Dark，再写 visuals（顺序不能反：set_visuals 写的是当前主题槽）。
-        cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
-        cc.egui_ctx.set_visuals(build_visuals());
-
-        // 读上次的界面偏好（缩放 + 窗口大小 + 语言）；窗口大小由 main.rs 建窗口时用
+        // 读上次的界面偏好（缩放 + 窗口大小 + 语言 + 主题）；窗口大小由 main.rs 建窗口时用
         let saved = Settings::load();
+        // 先按存的主题钉死 egui 主题槽 + 写我们调过的 visuals（顺序不能反）
+        apply_theme(&cc.egui_ctx, saved.theme);
         let zoom = saved.zoom;
         let lang = saved.lang;
         cc.egui_ctx.set_zoom_factor(zoom);
@@ -301,6 +295,7 @@ impl App {
             rect: prev.rect,
             lang,
             lhm_autostart: prev.lhm_autostart,
+            theme: prev.theme,
         };
         if let Some(r) = Self::observed_rect(ctx) {
             st.rect = Some(r);
@@ -691,17 +686,52 @@ fn install_fonts(ctx: &egui::Context) -> String {
 
 /// 配色：把默认那套偏暗的灰调亮，减少眼睛疲劳。
 ///
-/// · 正文 → 接近白（默认 dark 主题是灰 ~160，偏灰）
+/// · 正文 → 接近白（默认 dark 主题是灰 ~160，偏灰）/ 浅色主题下接近黑
 /// · `.weak()` 的次要文字 → 柔和冷灰（默认更暗，几乎看不出内容）
-fn build_visuals() -> egui::Visuals {
-    let mut v = egui::Visuals::dark();
-    // 正文（Label 默认色取自 widgets.noninteractive.fg_stroke）
-    v.widgets.noninteractive.fg_stroke.color = egui::Color32::from_rgb(228, 234, 243);
-    // .weak() 的次要文字（默认是 text_color * weak_text_alpha，很暗）
-    v.weak_text_color = Some(egui::Color32::from_rgb(172, 185, 201));
-    // .strong() 的颜色取自 widgets.active（egui 里 strong_text_color() 就是它）
-    v.widgets.active.fg_stroke.color = egui::Color32::from_rgb(246, 250, 255);
+///
+/// `dark=true` 沿用原深色配色；`dark=false` 用浅色底 + 深色文字（正常背景）。
+fn build_visuals(dark: bool) -> egui::Visuals {
+    let mut v = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    if dark {
+        // 正文（Label 默认色取自 widgets.noninteractive.fg_stroke）
+        v.widgets.noninteractive.fg_stroke.color = egui::Color32::from_rgb(228, 234, 243);
+        // .weak() 的次要文字（默认是 text_color * weak_text_alpha，很暗）
+        v.weak_text_color = Some(egui::Color32::from_rgb(172, 185, 201));
+        // .strong() 的颜色取自 widgets.active（egui 里 strong_text_color() 就是它）
+        v.widgets.active.fg_stroke.color = egui::Color32::from_rgb(246, 250, 255);
+    } else {
+        // 浅色底：正文用近黑深灰，次要文字柔和灰，保证对比度
+        v.widgets.noninteractive.fg_stroke.color = egui::Color32::from_rgb(33, 37, 45);
+        v.weak_text_color = Some(egui::Color32::from_rgb(96, 106, 122));
+        v.widgets.active.fg_stroke.color = egui::Color32::from_rgb(16, 20, 28);
+    }
     v
+}
+
+/// 把「深色主题下设计的霓虹色」按浅/深背景调整对比度：浅色背景下压暗一档，避免
+/// 青/绿这类高亮色在白底上看不清；深色背景原样返回。
+pub(crate) fn accent_for_bg(c: egui::Color32, dark: bool) -> egui::Color32 {
+    if dark {
+        return c;
+    }
+    let (r, g, b, _) = (c.r(), c.g(), c.b(), c.a());
+    // 线性压暗：原值 *0.6 再加 30，既保证可读性又不至于死黑
+    egui::Color32::from_rgb(
+        ((r as u32 * 60 / 100) + 30).min(255) as u8,
+        ((g as u32 * 60 / 100) + 30).min(255) as u8,
+        ((b as u32 * 60 / 100) + 30).min(255) as u8,
+    )
+}
+
+/// 应用主题：先钉死 egui 主题槽，再写我们手工调过的 visuals（顺序不能反）。
+fn apply_theme(ctx: &egui::Context, theme: Theme) {
+    let dark = theme.is_dark();
+    ctx.set_theme(theme.pref());
+    ctx.set_visuals(build_visuals(dark));
 }
 
 /// 界面设置的落盘位置：`%LOCALAPPDATA%\Ra6e2Monitor\ui.json`
@@ -741,6 +771,32 @@ fn settings_path() -> std::path::PathBuf {
     std::path::PathBuf::from(base).join("Ra6e2Monitor").join("ui.json")
 }
 
+/// 界面主题。
+/// `Dark` = 深色背景（默认，沿用原配色）；`Light` = 正常/浅色背景。
+///
+/// ⚠ egui 0.37 的 `ThemePreference` 默认是 **System**：系统一旦切到浅色主题，
+///   它会用浅色 visuals 覆盖掉我们手工调过的配色。所以这里把主题**显式**落盘，
+///   启动时按存的值钉死 `Dark` / `Light`，避免跟随系统被覆盖。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Theme {
+    /// 映射成 egui 的主题偏好（顺序：先 set_theme 再 set_visuals，否则槽位不对）。
+    pub fn pref(self) -> egui::ThemePreference {
+        match self {
+            Theme::Dark => egui::ThemePreference::Dark,
+            Theme::Light => egui::ThemePreference::Light,
+        }
+    }
+    pub fn is_dark(self) -> bool {
+        matches!(self, Theme::Dark)
+    }
+}
+
 /// 会持久化到 `%LOCALAPPDATA%\Ra6e2Monitor\ui.json` 的用户界面偏好。
 ///
 /// 记住三样东西：
@@ -761,6 +817,8 @@ pub struct Settings {
     /// 完全由用户在「设置 → LHM 开机自启」里勾选才创建（登录时以最高权限自启 LHM，
     /// 把冷启动提前到开机，开上位机时数据零延迟）。
     pub lhm_autostart: bool,
+    /// 界面主题。**默认深色**（与改之前一致）。`Light` = 正常/浅色背景。
+    pub theme: Theme,
 }
 
 impl Default for Settings {
@@ -770,6 +828,7 @@ impl Default for Settings {
             rect: None,
             lang: Lang::Zh,
             lhm_autostart: false,
+            theme: Theme::Dark,
         }
     }
 }
@@ -811,6 +870,9 @@ impl Settings {
         if let Some(a) = v.get("lhm_autostart").and_then(|x| x.as_bool()) {
             out.lhm_autostart = a;
         }
+        if let Some(t) = v.get("theme").and_then(|x| x.as_u64()) {
+            out.theme = if t == 1 { Theme::Light } else { Theme::Dark };
+        }
         out
     }
 
@@ -825,6 +887,10 @@ impl Settings {
         text.push_str(&format!("\"zoom\":{},", self.zoom));
         text.push_str(&format!("\"lang\":{}", self.lang.to_u8()));
         text.push_str(&format!(", \"lhm_autostart\":{}", self.lhm_autostart));
+        text.push_str(&format!(
+            ", \"theme\":{}",
+            if self.theme.is_dark() { 0 } else { 1 }
+        ));
         if let Some((l, t, r, b)) = self.rect {
             text.push_str(&format!(", \"rect\":[{l}, {t}, {r}, {b}]"));
         }
@@ -1075,6 +1141,22 @@ impl App {
                             self.pending.save();
                         }
                         ui.separator();
+                        // 界面主题：深色背景 / 正常(浅色)背景，勾选=深色
+                        ui.label(
+                            egui::RichText::new(T::Theme.t(self.lang)).size(11.0).weak(),
+                        );
+                        let mut dark_bg = self.pending.theme.is_dark();
+                        if ui
+                            .checkbox(&mut dark_bg, T::DarkBg.t(self.lang))
+                            .clicked()
+                        {
+                            let t = if dark_bg { Theme::Dark } else { Theme::Light };
+                            self.pending.theme = t;
+                            self.saved.theme = t;
+                            apply_theme(ui.ctx(), t);
+                            self.pending.save();
+                        }
+                        ui.separator();
                         ui.label(
                             egui::RichText::new(format!("当前 {:.0}%", self.zoom * 100.0))
                                 .size(11.0)
@@ -1237,7 +1319,7 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         sample: &Sample,
-        hist: &History,
+        _hist: &History,
         sent: u64,
         errors: u64,
         last_frame: &str,
@@ -1245,7 +1327,7 @@ impl App {
     ) {
         // 顶部信息条：选卡 + GPU 数据来源
         // 2026-10-28 用户要求把「选卡 + 数据来源」提到中间区顶部，
-        // 并用淡绿高亮强调（仅 GPU 来源，语义与旧版一致）。
+        // 背景复用分组框统一配色（不再用绿色高亮，深色下白字更清晰）。
         {
             let (adapters, sel, src) = match self.shared.lock().ok() {
                 Some(s) => (s.gpu_adapters.clone(), s.gpu_selection, s.gpu_source),
@@ -1261,11 +1343,9 @@ impl App {
                     .collect();
                 let mut sel = sel.min(names.len().saturating_sub(1));
 
-                let strip = egui::Frame::new()
-                    .inner_margin(egui::Margin::symmetric(10, 7))
-                    .fill(egui::Color32::from_rgb(30, 43, 30))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 130, 70)))
-                    .corner_radius(6.0);
+                // 信息条：复用分组框统一背景（不再用绿色填充，避免深色背景下白字看不清）
+                let strip = egui::Frame::group(ui.style())
+                    .inner_margin(egui::Margin::symmetric(10, 7));
                 strip.show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
@@ -1291,93 +1371,166 @@ impl App {
         ui.label(egui::RichText::new(T::Telemetry.t(self.lang)).size(11.0).weak());
         ui.add_space(5.0);
 
-        let fmt = |v: Option<i32>, unit: &str| match v {
-            Some(x) => format!("{x}{unit}"),
-            None => "—".to_string(),
+        // 三张卡片：半圆刻度盘阵列（1:1 复刻工业面板风）。卡片标题用主题色霓虹标；
+        // 每个表盘可点击切换该指标"是否上报"掩码（dim = 未选中）。底部历史曲线已取消。
+        //
+        // 游标平滑：监控线程 4 Hz 才更新一次采样值，若直接用它算弧/游标就会每 ~250 ms
+        // 硬跳一下。这里用 egui 自带的缓动动画（animate_value）按时间插值，让游标在两
+        // 次采样之间平滑滑动；动画期间 egui 会自动续帧，因此看起来是连续移动而非跳动。
+        let ctx = ui.ctx().clone();
+        #[allow(deprecated)]
+        let anim = |id: &'static str, v: Option<i32>| -> Option<f32> {
+            v.map(|x| ctx.animate_value_with_time(egui::Id::new(id), x as f32, 0.28))
         };
-
+        ui.add_space(4.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.checkbox(&mut self.mask.cpu_group, egui::RichText::new(T::Cpu.t(self.lang)).size(12.0).strong());
-            ui.add_space(2.0);
-            // bottom_row：底对齐 + 可换行（窗口窄或 zoom 调大时自动换行）
-            bottom_row(ui, |ui| {
-                ui.add_enabled_ui(self.mask.cpu_group, |ui| {
-                    ui.checkbox(&mut self.mask.cpu_temp, egui::RichText::new(T::Temp.t(self.lang)).size(14.0));
-                    readout_value(ui, &fmt(sample.ct, "°C"), 42.0, 14.0);
-                    ui.add_space(6.0);
-                    ui.checkbox(&mut self.mask.cpu_load, egui::RichText::new(T::Load.t(self.lang)).size(14.0));
-                    readout_value(ui, &fmt(sample.cu, "%"), 34.0, 14.0);
-                    ui.add_space(6.0);
-                    ui.checkbox(&mut self.mask.cpu_fan, egui::RichText::new(T::Fan.t(self.lang)).size(14.0));
-                    readout_value(ui, &fmt(sample.cf_display, sample.cf_unit.suffix()), 68.0, 14.0);
-                });
+            ui.checkbox(
+                &mut self.mask.cpu_group,
+                egui::RichText::new(T::Cpu.t(self.lang)).size(13.0).strong().color(gauge::CPU_TITLE),
+            );
+            ui.add_space(4.0);
+            // 三表盘按列等分铺开，避免右侧留白、弧形不等距
+            let mut c_temp = false;
+            let mut c_load = false;
+            let mut c_fan = false;
+            ui.columns(3, |cols| {
+                c_temp = gauge::gauge(
+                    &mut cols[0],
+                    T::Temp.t(self.lang),
+                    "°C",
+                    anim("g_cpu_temp", sample.ct),
+                    100.0,
+                    gauge::TEMP_COLOR,
+                    self.mask.cpu_temp,
+                )
+                .clicked();
+                c_load = gauge::gauge(
+                    &mut cols[1],
+                    T::Load.t(self.lang),
+                    "%",
+                    anim("g_cpu_load", sample.cu),
+                    100.0,
+                    gauge::LOAD_COLOR,
+                    self.mask.cpu_load,
+                )
+                .clicked();
+                let cpu_fan_max = fan_max(sample.cf_unit);
+                c_fan = gauge::gauge(
+                    &mut cols[2],
+                    T::Fan.t(self.lang),
+                    sample.cf_unit.suffix(),
+                    anim("g_cpu_fan", sample.cf_display),
+                    cpu_fan_max,
+                    gauge::FAN_COLOR,
+                    self.mask.cpu_fan,
+                )
+                .clicked();
             });
-            // 卡片尾部迷你曲线：图例按实际文字宽度自适应 + 曲线吃满剩余宽度（顶右缘）
-            ui.spacing_mut().item_spacing.y = 0.0;
-            let bar_h = 18.0;
-            let lang = self.lang;
-            let spec = [
-                (&hist.ct, SPARK_TEMP, 4.0, 0.04, 0.28),
-                (&hist.cf, SPARK_FAN, 100.0, 0.38, 0.62),
-                (&hist.cu, SPARK_LOAD, 5.0, 0.72, 0.96),
-            ];
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                // 图例自然占内容宽度（中/英文各按自身文字宽度），不再固定预留 30%
-                spark_legend(ui, lang);
-                ui.add_space(2.0);
-                // 曲线吃满剩余宽度，保证顶到卡片右缘
-                sparkline(ui, bar_h, ui.available_width(), &spec);
-            });
+            if c_temp {
+                self.mask.cpu_temp = !self.mask.cpu_temp;
+            }
+            if c_load {
+                self.mask.cpu_load = !self.mask.cpu_load;
+            }
+            if c_fan {
+                self.mask.cpu_fan = !self.mask.cpu_fan;
+            }
         });
 
         ui.add_space(6.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.checkbox(&mut self.mask.gpu_group, egui::RichText::new(T::Gpu.t(self.lang)).size(12.0).strong());
-            ui.add_space(2.0);
-            bottom_row(ui, |ui| {
-                ui.add_enabled_ui(self.mask.gpu_group, |ui| {
-                    ui.checkbox(&mut self.mask.gpu_temp, egui::RichText::new(T::Temp.t(self.lang)).size(14.0));
-                    readout_value(ui, &fmt(sample.gt, "°C"), 42.0, 14.0);
-                    ui.add_space(6.0);
-                    ui.checkbox(&mut self.mask.gpu_load, egui::RichText::new(T::Load.t(self.lang)).size(14.0));
-                    readout_value(ui, &fmt(sample.gu, "%"), 34.0, 14.0);
-                    ui.add_space(6.0);
-                    ui.checkbox(&mut self.mask.gpu_fan, egui::RichText::new(T::Fan.t(self.lang)).size(14.0));
-                    readout_value(ui, &fmt(sample.gf_display, sample.gf_unit.suffix()), 68.0, 14.0);
-                    ui.add_space(6.0);
-                    ui.checkbox(&mut self.mask.gpu_vram, egui::RichText::new(T::Vram.t(self.lang)).size(14.0));
-                    readout_value(ui, &fmt(sample.gv, "%"), 34.0, 14.0);
-                });
+            ui.checkbox(
+                &mut self.mask.gpu_group,
+                egui::RichText::new(T::Gpu.t(self.lang)).size(13.0).strong().color(gauge::GPU_TITLE),
+            );
+            ui.add_space(4.0);
+            // 四表盘按列等分铺开，避免右侧留白、弧形不等距
+            let mut g_temp = false;
+            let mut g_load = false;
+            let mut g_fan = false;
+            let mut g_vram = false;
+            ui.columns(4, |cols| {
+                g_temp = gauge::gauge(
+                    &mut cols[0],
+                    T::Temp.t(self.lang),
+                    "°C",
+                    anim("g_gpu_temp", sample.gt),
+                    100.0,
+                    gauge::TEMP_COLOR,
+                    self.mask.gpu_temp,
+                )
+                .clicked();
+                g_load = gauge::gauge(
+                    &mut cols[1],
+                    T::Load.t(self.lang),
+                    "%",
+                    anim("g_gpu_load", sample.gu),
+                    100.0,
+                    gauge::LOAD_COLOR,
+                    self.mask.gpu_load,
+                )
+                .clicked();
+                let gpu_fan_max = fan_max(sample.gf_unit);
+                g_fan = gauge::gauge(
+                    &mut cols[2],
+                    T::Fan.t(self.lang),
+                    sample.gf_unit.suffix(),
+                    anim("g_gpu_fan", sample.gf_display),
+                    gpu_fan_max,
+                    gauge::FAN_COLOR,
+                    self.mask.gpu_fan,
+                )
+                .clicked();
+                g_vram = gauge::gauge(
+                    &mut cols[3],
+                    T::Vram.t(self.lang),
+                    "%",
+                    anim("g_gpu_vram", sample.gv),
+                    100.0,
+                    gauge::MEM_COLOR,
+                    self.mask.gpu_vram,
+                )
+                .clicked();
             });
-            // 卡片尾部迷你曲线：图例按实际文字宽度自适应 + 曲线吃满剩余宽度（顶右缘）
-            ui.spacing_mut().item_spacing.y = 0.0;
-            let bar_h = 18.0;
-            let lang = self.lang;
-            let spec = [
-                (&hist.gt, SPARK_TEMP, 4.0, 0.04, 0.28),
-                (&hist.gf, SPARK_FAN, 100.0, 0.38, 0.62),
-                (&hist.gu, SPARK_LOAD, 5.0, 0.72, 0.96),
-            ];
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                // 图例自然占内容宽度（中/英文各按自身文字宽度），不再固定预留 30%
-                spark_legend(ui, lang);
-                ui.add_space(2.0);
-                // 曲线吃满剩余宽度，保证顶到卡片右缘
-                sparkline(ui, bar_h, ui.available_width(), &spec);
-            });
+            if g_temp {
+                self.mask.gpu_temp = !self.mask.gpu_temp;
+            }
+            if g_load {
+                self.mask.gpu_load = !self.mask.gpu_load;
+            }
+            if g_fan {
+                self.mask.gpu_fan = !self.mask.gpu_fan;
+            }
+            if g_vram {
+                self.mask.gpu_vram = !self.mask.gpu_vram;
+            }
         });
 
         ui.add_space(6.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            bottom_row(ui, |ui| {
-                ui.checkbox(&mut self.mask.mem, egui::RichText::new(T::Memory.t(self.lang)).size(12.0).strong());
-                // 间距由 item_spacing.x 提供，别再叠加 add_space（会变成 16px）
-                readout_value(ui, &fmt(sample.mu, "%"), 30.0, 12.0);
+            ui.checkbox(
+                &mut self.mask.mem,
+                egui::RichText::new(T::Memory.t(self.lang)).size(13.0).strong().color(gauge::MEM_COLOR),
+            );
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if gauge::gauge(
+                    ui,
+                    T::Memory.t(self.lang),
+                    "%",
+                    anim("g_mem", sample.mu),
+                    100.0,
+                    gauge::MEM_COLOR,
+                    self.mask.mem,
+                )
+                .clicked()
+                {
+                    self.mask.mem = !self.mask.mem;
+                }
             });
         });
 
@@ -1436,6 +1589,16 @@ impl App {
 ///
 /// 代价：这一行**不会自动换行**了（固定单行高度）。
 /// 窗口很窄时宁可横向溢出，也不要布局被撑坏 —— 溢出至少看得见、能调窗口。
+/// 风扇量程：RPM → 3000；百分比 → 100。表盘进度弧用。
+#[inline]
+fn fan_max(u: crate::collector::FanUnit) -> f32 {
+    match u {
+        crate::collector::FanUnit::Rpm => 3000.0,
+        crate::collector::FanUnit::Percent => 100.0,
+    }
+}
+
+#[allow(dead_code)]
 fn bottom_row<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let height = ui.spacing().interact_size.y; // 标准控件行高
     ui.allocate_ui_with_layout(
@@ -1447,8 +1610,11 @@ fn bottom_row<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 }
 
 /// 曲线颜色：温度红 / 负载绿 / 风扇青（深色主题下对比清晰）。
+#[allow(dead_code)]
 const SPARK_TEMP: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x5B, 0x5B);
+#[allow(dead_code)]
 const SPARK_LOAD: egui::Color32 = egui::Color32::from_rgb(0x4C, 0xE0, 0x70);
+#[allow(dead_code)]
 const SPARK_FAN: egui::Color32 = egui::Color32::from_rgb(0x29, 0xB6, 0xF6);
 
 /// 在卡片底部画迷你趋势线（多色、上下错带、自适应量程、零依赖）。
@@ -1459,6 +1625,7 @@ const SPARK_FAN: egui::Color32 = egui::Color32::from_rgb(0x29, 0xB6, 0xF6);
 ///   三条线各占一带、互不压叠，避免挤在同一条细带里糊成一团。
 /// - `NaN` 处断线（缺测不留假线）。
 /// - x 轴按**固定 HIST_CAP 点**映射，数据不足时曲线从右侧生长（最新点恒在最右）。
+#[allow(dead_code)]
 fn sparkline(
     ui: &mut egui::Ui,
     height: f32,
@@ -1519,6 +1686,7 @@ fn sparkline(
 }
 
 /// 曲线左侧的三色图例（温度 / 风扇 / 负载）——曲线只占卡片尾部，左端留白放它。
+#[allow(dead_code)]
 fn spark_legend(ui: &mut egui::Ui, lang: Lang) {
     for (color, text) in [
         (SPARK_TEMP, T::Temp.t(lang)),
@@ -1548,6 +1716,7 @@ fn spark_legend(ui: &mut egui::Ui, lang: Lang) {
 ///   宽度钉死、文本紧贴左侧标签、垂直居中，三者同时满足。
 ///
 /// 宽度按每列最长文本预留（温度 `100°C`、风扇 `2500 RPM`、百分比 `100%`）。
+#[allow(dead_code)]
 fn readout_value(ui: &mut egui::Ui, text: &str, width: f32, size: f32) {
     let h = ui.spacing().interact_size.y;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
@@ -1593,6 +1762,7 @@ mod settings_tests {
             rect: Some((240, 120, 1520, 840)),   // 物理像素外框：1280×720 @ (240,120)
             lang: Lang::Zh,
             lhm_autostart: true,
+            theme: Theme::Dark,
         };
         want.save();
         assert_eq!(Settings::load(), want, "写进去的缩放/窗口大小要能原样读回");

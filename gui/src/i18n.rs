@@ -77,6 +77,8 @@ pub enum T {
     Timeouts,
     LhmAutostart,
     LhmAutostartHint,
+    Theme,
+    DarkBg,
 }
 
 impl T {
@@ -156,6 +158,10 @@ impl T {
             (T::LhmAutostartHint, Lang::En) => {
                 "Off by default. Tick to create a scheduled task that launches LHM (temp/fan source) at logon with highest privileges, so data is ready instantly; untick to remove it"
             }
+            (T::Theme, Lang::Zh) => "界面主题",
+            (T::Theme, Lang::En) => "Theme",
+            (T::DarkBg, Lang::Zh) => "深色背景",
+            (T::DarkBg, Lang::En) => "Dark background",
         }
     }
 }
