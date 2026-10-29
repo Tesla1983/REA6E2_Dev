@@ -13,6 +13,7 @@
 #include "nt7534/bsp_nt7534.h"
 #include "nt7534/u8g2_port.h"     /* u8g2 移植层: 真 ° 字形 + 线段/矩形/圆 */
 #include "nt7534/fan_frames.h"    /* 3 叶 20x20 风扇位图帧(24 帧, scripts/gen_fan_frames.py 生成) */
+#include "nt7534/dino_frames.h"   /* 离线恐龙 2 帧 + 仙人掌, scripts/gen_dino_frames.py 生成 */
 #include "oled/bsp_oled.h"             /* 1.3" OLED 兼作"第二指示灯" */
 #include "rtt/rtt_log.h"
 #include "uart/bsp_uart_link.h"        /* 上位机数据（SCI0 / USB CDC 共用解析） */
@@ -24,6 +25,11 @@
 /* 1 = STAGE6 走"列偏移 0..4 全扫"自检；0 = 直接用 NT7534_COL_OFFSET 常驻方案 A。
  * 实测偏移 3 是对的（用户目视确认 4/5 那张四边齐），所以默认 0。 */
 #define NT7534_OFFSET_SWEEP  (0)
+
+/* 离线动画: USB 未枚举(场景A)时屏上显示什么。
+ * 1 = Chrome 断网恐龙风格(恐龙随机跳 + 地面滚动 + 仙人掌左移, 纯装饰不碰撞);
+ * 0 = 回退到原 USB 中断寄存器自证页(draw_usb_diag, 便于 USB 中断调试)。 */
+#define NT7534_OFFLINE_DINO  (1)
 
 /** OLED 是否可用。可用时它显示当前处于第几幕 ——
  *  3.5" 屏不亮时, 这一行字就是"MCU 在跑、代码走到哪"的唯一证据。 */
@@ -218,6 +224,7 @@ static void num4(char * p, size_t n, int16_t v)
  *
  *  只在 USB 尚未枚举时占用画面 —— 一旦链路通了, 自动换回 CPU/GPU/RAM 三行。
  */
+#if (NT7534_OFFLINE_DINO == 0)   /* 仅宏切回(=0)时保留 USB 寄存器自证页 */
 static void draw_usb_diag(u8g2_t * g)
 {
     volatile uint32_t * p_ielsr  = (volatile uint32_t *) 0x40006300UL;  /* IELSR0  */
@@ -243,6 +250,284 @@ static void draw_usb_diag(u8g2_t * g)
                     (unsigned long) g_usb_events, (unsigned long) g_usb_cfg_cnt,
                     (unsigned) (*(volatile uint32_t *) 0xE000E200UL & 1u));
     u8g2_DrawUTF8(g, 0, 48, line);
+}
+#endif /* (NT7534_OFFLINE_DINO == 0) */
+
+/* ===== 离线恐龙动画（场景 A：USB 未枚举）=====
+ * 替代原寄存器自证页。恐龙在地面随机跳, 地面虚线向左滚, 仙人掌从右向左飘(纯装饰, 不碰撞)。
+ * 状态机由 NT7534_Run() 的 2ms 细片循环驱动(dino_advance + draw_dino_offline)。 */
+
+extern volatile uint32_t g_ms_tick;   /* 由 SysTick 递增, 用作 dino_init 的随机种子 */
+
+/* --- 物理/节奏参数（像素 / 毫秒）--- */
+#define DINO_GROUND_Y       62          /* 地面线 y */
+#define DINO_BASE_X         6           /* 恐龙站立足底 x 左上角 */
+#define DINO_JUMP_H_MIN     6           /* 随机跳跃峰值下限(px) */
+#define DINO_JUMP_H_MAX     19          /* 随机跳跃峰值上限(px): 站立头顶在屏 y19 ⇒ 跳 19 时 dino_y = 17-19 = -2,
+                                          * 绘制时裁掉帧顶 2 行空白(y0/y1 本为空)让头顶正好贴屏 y0, 用满空间不越界。 */
+#define DINO_JUMP_DUR       600         /* 一次跳跃总时长(ms): 上 300 + 下 300 */
+#define DINO_JUMP_MIN       600         /* 下次跳最小间隔(ms) */
+#define DINO_JUMP_MAX       2200        /* 下次跳最大间隔(ms) */
+#define DINO_LEG_INTERVAL   120         /* 待机腿帧交替周期(ms) */
+#define DINO_FRAME_MS       33          /* 动画帧间隔 ≈ 30fps */
+#define DINO_SPEED_100      3           /* 地面/仙人掌速度: 0.03 px/ms = 30 px/s, 累积单位 1/100 px。
+                                          * 说明: 原用 1/10 px 单位时最小只能到 1 = 100 px/s, 仍偏快 ⇒ 换 1/100 px
+                                          * 粒度, 30 px/s 穿 128px 屏约 4.8s, 仙人掌能看清。 */
+#define DINO_CACTUS_GAP_MIN 28
+#define DINO_CACTUS_GAP_MAX 70
+
+/* --- 状态 --- */
+static uint8_t  s_dino_prev_offline = 0u;   /* 上一轮是否场景A(检测进入以 init) */
+static uint32_t s_dino_tick         = 0u;   /* 上次动画刷新时刻(ms) */
+static uint32_t s_dino_next_jump    = 0u;   /* 距下次跳剩余(ms), 在跳时为 0 */
+static uint32_t s_dino_jump_t       = 0u;   /* 当前跳跃已进行(ms), 0 = 未在跳 */
+static uint32_t s_dino_jump_h       = 6u;   /* 本次跳跃峰值高度(px), 起跳时在 [MIN,MAX] 内随机 */
+static uint32_t s_dino_leg_t        = 0u;   /* 腿帧计时 */
+static uint8_t  s_dino_leg          = 0u;   /* 当前腿帧 0/1 */
+static uint32_t s_dino_ground       = 0u;   /* 地面滚动累积(1/100 px) */
+static int32_t  s_cactus_pos[2]     = { 4800, 10400 };  /* 仙人掌 x(1/100 px), 初值 48.0 / 104.0 */
+static uint8_t  s_cactus_kind[2]    = { 1u, 2u };       /* 每株仙人掌的高度档位(0..CACTUS_N-1) */
+/* 云: 背景装饰, 只出现在恐龙站立头顶(y19)以上的 y0..18 区域; 三种尺寸随机; 缓慢左移(视差) */
+#define DINO_CLOUD_CNT  2
+static int32_t  s_cloud_pos[DINO_CLOUD_CNT]  = { 2600, 8200 };  /* 1/100 px: 26.0 / 82.0 */
+static uint8_t  s_cloud_kind[DINO_CLOUD_CNT] = { 0u, 2u };      /* 云尺寸档位(0..CLOUD_N-1) */
+static uint8_t  s_cloud_y[DINO_CLOUD_CNT]    = { 2u, 8u };      /* 云顶部 y(0..18-h) */
+static uint32_t s_dino_rng          = 0x12345678u;    /* xorshift32 状态 */
+
+/* ---- 片上 TRNG（RA6E2 硬件有 TRNG，FSP 6.6 无 r_trng 驱动 ⇒ 裸寄存器）----
+ * R_TRNG @0x40162000: +0x00 TRNGSDR(SEED 数据), +0x02 TRNGSCR0(bit2 SGSTART / bit3 SGCEN / bit7 RDRDY),
+ *   +0x03 TRNGSCR1(bit0 INTEN)。
+ * RDRDY=1 表示 32 位 SEED 就绪；连读 TRNGSDR 4 次取完整 32 位，读完后 RDRDY 自动清 0。
+ * 模块启停照 FSP system.c: 先解锁 LPC 寄存器保护再 R_BSP_MODULE_START，用完再 stop。
+ * ⚠ 全程带超时，绝不无限阻塞；失败返回 0，由调用方回落到 g_ms_tick 抖动。 */
+#define DINO_TRNG_SDR   (*(volatile uint8_t *) 0x40162000UL)
+#define DINO_TRNG_SCR0  (*(volatile uint8_t *) 0x40162002UL)
+#define DINO_TRNG_SCR1  (*(volatile uint8_t *) 0x40162003UL)
+
+volatile uint32_t g_dino_trng_dbg = 0u;   /* 调试: 最近一次 TRNG 读值(0 = 超时/失败, 可用 probe-rs 读 RAM 验证) */
+
+static uint32_t dino_trng_u32(void)
+{
+    uint32_t guard;
+    uint32_t v;
+
+    R_BSP_RegisterProtectDisable(BSP_REG_PROTECT_OM_LPC_BATT);
+    R_BSP_MODULE_START(FSP_IP_TRNG, 0);
+    R_BSP_RegisterProtectEnable(BSP_REG_PROTECT_OM_LPC_BATT);
+
+    DINO_TRNG_SCR1 = 0x00u;                                   /* 关 TRNG 中断 */
+    DINO_TRNG_SCR0 = (uint8_t)(DINO_TRNG_SCR0 | (1u << 3));   /* SGCEN=1: 使能 SEED 生成电路 */
+
+    /* SGCEN 置位后至少等 3 个 TRNGCLK(手册), 用几次 volatile 读留足余量 */
+    (void) DINO_TRNG_SCR0; (void) DINO_TRNG_SCR0; (void) DINO_TRNG_SCR0; (void) DINO_TRNG_SCR0;
+
+    DINO_TRNG_SCR0 = (uint8_t)(DINO_TRNG_SCR0 | (1u << 2));   /* SGSTART=1: 启动一次生成 */
+
+    for (guard = 0u; guard < 500000u; guard++)                /* 等 RDRDY=1, 带超时 */
+    {
+        if ((DINO_TRNG_SCR0 & 0x80u) != 0u) { break; }
+    }
+    if ((DINO_TRNG_SCR0 & 0x80u) == 0u)
+    {
+        DINO_TRNG_SCR0 = (uint8_t)(DINO_TRNG_SCR0 & ~(1u << 3));
+        g_dino_trng_dbg = 0u;
+        return 0u;                                            /* 超时: 调用方回落 */
+    }
+
+    v  =  (uint32_t) DINO_TRNG_SDR;
+    v |= ((uint32_t) DINO_TRNG_SDR) << 8;
+    v |= ((uint32_t) DINO_TRNG_SDR) << 16;
+    v |= ((uint32_t) DINO_TRNG_SDR) << 24;
+
+    DINO_TRNG_SCR0 = (uint8_t)(DINO_TRNG_SCR0 & ~(1u << 3));  /* 关电路省电 */
+    g_dino_trng_dbg = v;
+    return v;
+}
+
+/* 轻量 PRNG（无 libm 依赖） */
+static uint32_t dino_rand_u32(void)
+{
+    uint32_t x = s_dino_rng;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    s_dino_rng = x;
+    return x;
+}
+static uint32_t dino_rand_range(uint32_t lo, uint32_t hi)
+{
+    return lo + (dino_rand_u32() % (hi - lo + 1u));
+}
+
+static void dino_init(void)
+{
+    /* 用片上 TRNG 播种; TRNG 超时/失败则回落 g_ms_tick 抖动, 保证种子非空 */
+    {
+        uint32_t trng = dino_trng_u32();
+        s_dino_rng = (trng != 0u) ? (trng | 1u) : ((0x12345678u ^ g_ms_tick) | 1u);
+    }
+    s_dino_jump_t    = 0u;
+    s_dino_jump_h    = DINO_JUMP_H_MIN;
+    s_dino_leg_t     = 0u;
+    s_dino_leg       = 0u;
+    s_dino_ground    = 0u;
+    s_cactus_pos[0]  = 4800;   /* 48.0 px */
+    s_cactus_pos[1]  = 10400;  /* 104.0 px */
+    s_cactus_kind[0] = (uint8_t) dino_rand_range(0u, (uint32_t) CACTUS_N - 1u);
+    s_cactus_kind[1] = (uint8_t) dino_rand_range(0u, (uint32_t) CACTUS_N - 1u);
+
+    /* 云: 随机尺寸 + 在恐龙头顶以上(y0..18)随机高度; 初始一左一右 */
+    s_cloud_pos[0]  = 2600;
+    s_cloud_kind[0] = (uint8_t) dino_rand_range(0u, (uint32_t) CLOUD_N - 1u);
+    s_cloud_y[0]    = (uint8_t) dino_rand_range(0u, 18u - g_cloud_hs[s_cloud_kind[0]]);
+    s_cloud_pos[1]  = 8200;
+    s_cloud_kind[1] = (uint8_t) dino_rand_range(0u, (uint32_t) CLOUD_N - 1u);
+    s_cloud_y[1]    = (uint8_t) dino_rand_range(0u, 18u - g_cloud_hs[s_cloud_kind[1]]);
+    s_dino_next_jump = dino_rand_range(DINO_JUMP_MIN, DINO_JUMP_MAX);
+}
+
+/** 推进一帧动画。dt_ms = 距上一帧真实毫秒(已 clamp <=100)。 */
+static void dino_advance(uint32_t dt_ms)
+{
+    uint32_t i;
+
+    /* 地面滚动 + 仙人掌左移: 用**固定每帧 1px(100 = 1.00px)**，不再按 dt 比例推进。
+     * 原 `dt * DINO_SPEED_100`: dt 在 32~35ms 间抖动 ⇒ 个别帧只走 0px、个别帧走 2px,
+     * 移动中的仙人掌逐帧不匀, 看起来就是"闪烁/抖动"。30fps 固定 1px/帧 = 30 px/s,
+     * 与 DINO_SPEED_100=3 的标称速度一致, 但每帧位移严格均匀。 */
+    s_dino_ground += 100u;
+    for (i = 0u; i < 2u; i++)
+    {
+        s_cactus_pos[i] -= 100;
+        int32_t cx = s_cactus_pos[i] / 100;
+        if (cx <= -(int32_t)CACTUS_W)
+        {
+            int32_t other = s_cactus_pos[(i == 0u) ? 1u : 0u] / 100;
+            int32_t gap   = (int32_t)dino_rand_range(DINO_CACTUS_GAP_MIN, DINO_CACTUS_GAP_MAX);
+            int32_t newpx = other + gap;
+            if (newpx < 128) { newpx = 128 + gap; }
+            s_cactus_pos[i]  = newpx * 100;
+            s_cactus_kind[i] = (uint8_t) dino_rand_range(0u, (uint32_t) CACTUS_N - 1u);
+        }
+    }
+
+    /* 云: 缓慢左移(~0.33 px/帧 ≈ 10 px/s, 视差); 出屏后从右侧按随机尺寸/高度重入 */
+    for (i = 0u; i < DINO_CLOUD_CNT; i++)
+    {
+        s_cloud_pos[i] -= 33;
+        int32_t clx = s_cloud_pos[i] / 100;
+        if (clx <= -(int32_t) g_cloud_ws[s_cloud_kind[i]])
+        {
+            int32_t other = s_cloud_pos[(i == 0u) ? 1u : 0u] / 100;
+            int32_t gap   = (int32_t) dino_rand_range(24u, 64u);
+            int32_t newpx = other + gap;
+            if (newpx < 128) { newpx = 128 + gap; }
+            s_cloud_pos[i]  = newpx * 100;
+            s_cloud_kind[i] = (uint8_t) dino_rand_range(0u, (uint32_t) CLOUD_N - 1u);
+            s_cloud_y[i]    = (uint8_t) dino_rand_range(0u, 18u - g_cloud_hs[s_cloud_kind[i]]);
+        }
+    }
+
+    /* 腿帧交替(待机跑动感) */
+    s_dino_leg_t += dt_ms;
+    if (s_dino_leg_t >= DINO_LEG_INTERVAL) { s_dino_leg_t = 0u; s_dino_leg ^= 1u; }
+
+    /* 跳跃调度 */
+    if (s_dino_jump_t == 0u)
+    {
+        if (s_dino_next_jump > dt_ms) { s_dino_next_jump -= dt_ms; }
+        else
+        {
+            /* 起跳: 本次峰值高度随机 [MIN,MAX], 保证不越过屏顶 */
+            s_dino_jump_h = dino_rand_range(DINO_JUMP_H_MIN, DINO_JUMP_H_MAX);
+            s_dino_jump_t = 1u;
+        }
+    }
+    else
+    {
+        if (s_dino_jump_t + dt_ms < DINO_JUMP_DUR) { s_dino_jump_t += dt_ms; }
+        else
+        {
+            s_dino_jump_t    = 0u;
+            s_dino_next_jump = dino_rand_range(DINO_JUMP_MIN, DINO_JUMP_MAX);
+        }
+    }
+}
+
+/** 当前跳跃高度(px, 三角波: 0→本次峰值 s_dino_jump_h→0)。 */
+static uint32_t dino_y_off(void)
+{
+    if (s_dino_jump_t == 0u) { return 0u; }
+    uint32_t half = DINO_JUMP_DUR / 2u;     /* 300 */
+    uint32_t d = (s_dino_jump_t < half) ? s_dino_jump_t : (DINO_JUMP_DUR - s_dino_jump_t);
+    return (s_dino_jump_h * d) / half;      /* 0..s_dino_jump_h(6..12) */
+}
+
+/** 整屏画一帧离线恐龙动画（自获取 u8g2 句柄, 可在任意调用点使用）。 */
+static void draw_dino_offline(void)
+{
+    u8g2_t * g = U8G2_Port();
+    uint32_t i;
+    uint32_t y_off = dino_y_off();
+    /* 官方帧底部有 2 行留白(y45/46 全空), +2 让恐龙脚贴住地面线 y62 */
+    int32_t  dino_y = (int32_t)(DINO_GROUND_Y - DINO_H + 2 - y_off);
+    /* 跳跃时用官方"双腿着地抬头"帧; 地面待机用跑步两帧交替 */
+    const uint8_t * dino_bmp = (s_dino_jump_t > 0u) ? g_dino_jump : g_dino_frames[s_dino_leg];
+    /* 高处跳时 dino_y 会变负, 而 u8g2 的 y 是无符号, 直接转会回绕成巨值画到屏外 ⇒
+     * 裁掉位图顶部若干行(每行 (DINO_W+7)/8 字节), 从第 -dino_y 行开始画, y 归 0。
+     * 帧顶 y0/y1 本就是空行, 裁掉的正是空白, 造型不受影响。 */
+    uint32_t dino_draw_h = DINO_H;
+    if (dino_y < 0)
+    {
+        uint32_t skip = (uint32_t)(-dino_y);
+        if (skip >= DINO_H) { skip = DINO_H - 1u; }
+        dino_bmp   += skip * ((DINO_W + 7u) / 8u);
+        dino_draw_h = DINO_H - skip;
+        dino_y      = 0;
+    }
+
+    u8g2_ClearBuffer(g);
+
+    /* 云(背景, 最先画 ⇒ 恐龙跳起来时压住云): 只出现在恐龙站立头顶 y19 以上的 y0..18 区域 */
+    for (i = 0u; i < DINO_CLOUD_CNT; i++)
+    {
+        int32_t clx = s_cloud_pos[i] / 100;
+        uint8_t ck  = s_cloud_kind[i];
+        uint8_t cw  = g_cloud_ws[ck];
+        if (clx > -(int32_t) cw && clx < 128)
+        {
+            u8g2_DrawXBMP(g, (u8g2_uint_t)clx, (u8g2_uint_t)s_cloud_y[i],
+                          cw, g_cloud_hs[ck], g_cloud_bmp[ck]);
+        }
+    }
+
+    /* 仙人掌(底部贴地面) */
+    for (i = 0u; i < 2u; i++)
+    {
+        int32_t cx   = s_cactus_pos[i] / 100;
+        uint8_t kind = s_cactus_kind[i];
+        uint8_t ch   = g_cactus_hs[kind];
+        if (cx > -(int32_t)CACTUS_W && cx < 128)
+        {
+            u8g2_DrawXBMP(g, (u8g2_uint_t)cx, (u8g2_uint_t)(DINO_GROUND_Y - ch + 1),
+                          CACTUS_W, ch, g_cactus_bmp[kind]);
+        }
+    }
+    /* 恐龙 */
+    u8g2_DrawXBMP(g, (u8g2_uint_t)DINO_BASE_X, (u8g2_uint_t)dino_y,
+                  DINO_W, dino_draw_h, dino_bmp);
+
+    /* 地面线放在恐龙之后画(双保险): 位图已在 U8G2_Port_Init 里开透明模式, 恐龙不再擦背景;
+     *   但恐龙绘制框 47 行、跑步时到 y63, 仍最后补画地面线/虚线, 确保脚下地平线绝不断。 */
+    u8g2_DrawHLine(g, 0, (int16_t)DINO_GROUND_Y, 128);
+    /* 地面滚动短横(每段 4px, 间隔 8px, 随滚动偏移) */
+    {
+        int16_t off = (int16_t)((s_dino_ground / 100u) % 8u);
+        int16_t x;
+        for (x = (int16_t)(-off); x < 128; x = (int16_t)(x + 8))
+        {
+            if (x >= 0) { u8g2_DrawHLine(g, (u8g2_uint_t)x, (int16_t)(DINO_GROUND_Y + 1), 4); }
+        }
+    }
+    U8G2_Port_Flush();
 }
 
 /* ===== 表格版布局 + 风扇（2026-10-25 定稿）=====
@@ -511,15 +796,26 @@ static void draw_layout_a(void)
         u8g2_SetFontMode(g, 1);     /* 透明: 只置位、不清背景(否则会擦断表格线/风扇) */
     }
 
-    u8g2_ClearBuffer(g);
-
-    /* 一条数据通路都没通的时候, 把画面让给 USB 中断三段自证(见 draw_usb_diag)。 */
+    /* USB 未枚举(场景A): 默认显示离线恐龙动画; 宏 NT7534_OFFLINE_DINO=0 时回退寄存器自证页。
+     * ⚠ 场景A 分支里**绝不能提前 ClearBuffer**: 本屏是 NT7534_BUS_MODE=2 的异步分页 DMA 刷新,
+     *   Flush 只是启动 DMA, 之后 8 页由 NT7534_Pump_Poll 每 2ms 推一页(~11ms 发完), 期间 DMA 一直在读
+     *   framebuffer。若在此清空缓冲又不重画, 正在飞的页会把空白发上屏 ⇒ "整屏随机闪白"。
+     *   清缓冲只放在"本帧后面必然重画并 Flush"的路径里。 */
     if (!UART_Link_Online() && !USB_CDC_Configured())
     {
+        if (0u == s_dino_prev_offline) { dino_init(); s_dino_prev_offline = 1u; }
+#if (NT7534_OFFLINE_DINO != 0)
+        /* 清缓冲 + 绘制 + Flush 由 30fps 驱动(draw_dino_offline)成对完成, 这里不碰 buffer。 */
+#else
+        u8g2_ClearBuffer(g);
         draw_usb_diag(g);
         U8G2_Port_Flush();
+#endif
         return;
     }
+    s_dino_prev_offline = 0u;
+
+    u8g2_ClearBuffer(g);
 
     /* --- 表格线 ---
      * 右边界 127(原 119): 屏右侧 x120..127 的 8px 空白全部用掉, 表格贴到最右一列。 */
@@ -960,6 +1256,20 @@ void NT7534_Run(void)
                         /* 脏区: x54..127 / y32..63 ⇒ tile tx=6(48), tw=10(48..127) */
                         U8G2_Port_FlushArea(6u, 4u, 10u, 4u);
                     }
+                }
+            }
+#endif
+            /* 离线恐龙动画: 仅场景A(USB 未枚举) 且宏开启时驱动, ≈30fps 整屏。 */
+#if (0 != U8G2_PORT_ENABLE)
+            if ((!UART_Link_Online()) && (!USB_CDC_Configured()) && (NT7534_OFFLINE_DINO != 0))
+            {
+                if ((uint32_t) (now - s_dino_tick) >= DINO_FRAME_MS)
+                {
+                    uint32_t dt = (uint32_t) (now - s_dino_tick);
+                    s_dino_tick = now;
+                    if (dt > 100u) { dt = 100u; }
+                    dino_advance(dt);
+                    draw_dino_offline();
                 }
             }
 #endif

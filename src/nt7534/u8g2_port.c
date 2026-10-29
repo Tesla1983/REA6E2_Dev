@@ -181,7 +181,14 @@ u8g2_t * U8G2_Port_Init(void)
      *    u8g2 的 lm6059 信息里默认给 1, 那是别的模块, 这里必须覆盖。 */
     s_u8g2.u8x8.x_offset = (uint8_t) NT7534_COL_OFFSET;
 
-    /* 5) 清一次屏, 免得残留上电随机点 */
+    /* 5) 位图透明模式: 只画置位像素, 不清矩形背景。
+     *    u8g2 默认 bitmap_transparency=0(不透明), DrawXBMP 会把 XBM 的 0 位涂成背景色 ⇒
+     *    恐龙 44x47 / 风扇矩形的"空位"会擦掉底下的地面线、表格线、正从恐龙身后路过的仙人掌,
+     *    表现为"恐龙有矩形边缘""地平线消失""仙人掌被切断"。
+     *    字体早已用 SetFontMode(1) 解决同类问题, 位图此前漏了 —— 这里补上。 */
+    u8g2_SetBitmapMode(&s_u8g2, 1u);
+
+    /* 6) 清一次屏, 免得残留上电随机点 */
     u8g2_ClearBuffer(&s_u8g2);
     u8g2_SendBuffer(&s_u8g2);
 
