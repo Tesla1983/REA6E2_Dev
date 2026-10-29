@@ -140,15 +140,30 @@ jobs:
           name: gui-release
           path: gui-artifacts
 
-      - name: Draft release notes (构建信息)
+      - name: Draft release notes (构建信息 + 版本要点)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           {
-            echo "## RA6E2 固件 + 上位机构建信息"
+            echo "## RA6E2 固件 + 上位机发布说明"
             echo ""
             echo "- 提交: \`${{ github.sha }}\`"
             echo "- 标签: \`${{ github.ref_name }}\`"
             echo "- 固件工具链: \`$(arm-none-eabi-gcc --version | head -1)\`"
             echo ""
+            # 取本次 tag 的注释作为「版本要点」（注释由发布者手写，含固件/上位机变更摘要）。
+            # release 任务无 git 仓库，故走 GitHub API：先取 tag ref 指向的对象，再取 tag 对象注释。
+            REF_SHA=$(gh api "repos/${{ github.repository }}/git/refs/tags/${{ github.ref_name }}" --jq '.object.sha' 2>/dev/null || true)
+            TAG_MSG=""
+            if [ -n "$REF_SHA" ]; then
+              TAG_MSG=$(gh api "repos/${{ github.repository }}/git/tags/${REF_SHA}" --jq '.message' 2>/dev/null || true)
+            fi
+            if [ -n "$TAG_MSG" ]; then
+              echo "### 版本要点"
+              echo ""
+              echo "$TAG_MSG"
+              echo ""
+            fi
             echo "### 固件下载"
             echo "- \`ra6e2_fw.bin\` —— 裸镜像, 烧录工具/上位机直接用"
             echo "- \`ra6e2_fw.hex\` —— Intel HEX, 通用编程器"
