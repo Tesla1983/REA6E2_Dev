@@ -1547,6 +1547,11 @@ impl App {
         let anim = |id: &'static str, v: Option<i32>| -> Option<f32> {
             v.map(|x| ctx.animate_value_with_time(egui::Id::new(id), x as f32, 0.28))
         };
+        // 三卡片等高：以最窄的 GPU(4 列) 列宽为基准，算出所有表盘共用的半径上限。
+        // 这样无论窗口多窄，三张卡片高度都一致；窄到极限时三张卡片一起缩小。
+        let content_w = ui.available_width();
+        let min_col = (content_w - 2.0 * ui.spacing().item_spacing.x) / 4.0;
+        let shared_r = ((min_col - 2.0 * 6.0) / 2.0).clamp(20.0, 54.0);
         ui.add_space(4.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1568,7 +1573,7 @@ impl App {
                     100.0,
                     self.pending.cpu_temp_warn,
                     self.pending.cpu_temp_crit,
-                    self.mask.cpu_temp,
+                    self.mask.cpu_temp, shared_r,
                 )
                 .clicked();
                 c_load = gauge::gauge(
@@ -1579,7 +1584,7 @@ impl App {
                     100.0,
                     70.0,
                     90.0,
-                    self.mask.cpu_load,
+                    self.mask.cpu_load, shared_r,
                 )
                 .clicked();
                 let cpu_fan_max = fan_max(sample.cf_unit);
@@ -1592,7 +1597,7 @@ impl App {
                     cpu_fan_max,
                     cpu_fan_warn,
                     cpu_fan_crit,
-                    self.mask.cpu_fan,
+                    self.mask.cpu_fan, shared_r,
                 )
                 .clicked();
             });
@@ -1629,7 +1634,7 @@ impl App {
                     100.0,
                     self.pending.gpu_temp_warn,
                     self.pending.gpu_temp_crit,
-                    self.mask.gpu_temp,
+                    self.mask.gpu_temp, shared_r,
                 )
                 .clicked();
                 g_load = gauge::gauge(
@@ -1640,7 +1645,7 @@ impl App {
                     100.0,
                     70.0,
                     90.0,
-                    self.mask.gpu_load,
+                    self.mask.gpu_load, shared_r,
                 )
                 .clicked();
                 let gpu_fan_max = fan_max(sample.gf_unit);
@@ -1653,7 +1658,7 @@ impl App {
                     gpu_fan_max,
                     gpu_fan_warn,
                     gpu_fan_crit,
-                    self.mask.gpu_fan,
+                    self.mask.gpu_fan, shared_r,
                 )
                 .clicked();
                 g_vram = gauge::gauge(
@@ -1664,7 +1669,7 @@ impl App {
                     100.0,
                     70.0,
                     90.0,
-                    self.mask.gpu_vram,
+                    self.mask.gpu_vram, shared_r,
                 )
                 .clicked();
             });
@@ -1700,7 +1705,7 @@ impl App {
                     100.0,
                     70.0,
                     90.0,
-                    self.mask.mem,
+                    self.mask.mem, shared_r,
                 )
                 .clicked()
                 {

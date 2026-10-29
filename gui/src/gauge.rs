@@ -7,8 +7,8 @@
 //! 阈值由调用方给（绝对值，与 `max` 同单位）：`warn` = 进入黄区的值，`crit` = 进入红区的值。
 //! 未选中上报（`enabled == false`）时整体 dim：轨道单色灰、不画进度、数值灰——语义不变。
 //!
-//! 布局：表盘按"所在容器宽度"自适应半径（列越宽表盘越大），水平居中，
-//! 因此调用方用 `ui.columns(n)` 即可让 n 个表盘等距铺开。
+//! 布局：表盘半径由调用方传入的 `radius_cap` 统一约束（而非各自按列宽浮动），
+//! 从而保证多张卡片等高；水平居中，调用方用 `ui.columns(n)` 即可让 n 个表盘等距铺开。
 
 use eframe::egui::{Align2, Color32, FontId, Pos2, Response, Sense, Shape, Stroke, Ui, Vec2};
 use crate::app::accent_for_bg;
@@ -54,10 +54,11 @@ pub fn gauge(
     warn: f32,
     crit: f32,
     enabled: bool,
+    radius_cap: f32,
 ) -> Response {
     let pad: f32 = 6.0; // 给弧线宽度留的边距
     let col_w = ui.available_width().max(40.0);
-    let radius = ((col_w - 2.0 * pad) / 2.0).clamp(20.0, 54.0);
+    let radius = ((col_w - 2.0 * pad) / 2.0).clamp(20.0, radius_cap);
     let arc_stroke = (radius * 0.22).clamp(7.0, 11.0);
     let val_font = (radius * 0.34).clamp(12.0, 18.0);
     // 高度 = 半圆 + 底部标签区；整个容器（含左右留白）都可点击
