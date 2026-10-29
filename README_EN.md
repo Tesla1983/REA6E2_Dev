@@ -62,7 +62,7 @@ Pin assignment:
   version), so the host recognizes the board by **chip UID** instead of the COM port
   (which changes on every replug).
 - Keeps the last readings on disconnect.
-- Current firmware version: **v24** (`0x4E540018`).
+- Current firmware version: **v25** (`0x4E540019`).
 
 ### Host app (ra6e2-monitor, Windows)
 
@@ -72,6 +72,9 @@ Pin assignment:
 - Dark theme; remembers window zoom, position, and size (`ui.json`, portable mode supported).
 - System tray: clicking the window **X = quit**; only the "minimize to tray" button hides it.
 - GPU VRAM usage card (off by default).
+- The semicircular gauge on each card is clickable to toggle whether that metric is
+  sent: a **lit (highlighted) gauge means it is selected and sending**; a **dimmed
+  gauge means that item is not sent**.
 - Fan unit auto-adapts: sends RPM when available, otherwise `%` (UI shows `%`).
 - Shows readings even when not connected (bright green).
 
@@ -94,7 +97,7 @@ $CT:..,CU:..,CF:..,GT:..,GU:..,GF:..,MU:..,GV:..*XX\r\n
 | `GU` | GPU utilization | % |
 | `GF` | GPU fan speed | RPM |
 | `MU` | Memory usage | % |
-| `GV` | GPU VRAM usage | % (not yet consumed by FW v24, reserved) |
+| `GV` | GPU VRAM usage | % (not yet consumed by FW v25, reserved) |
 
 - `XX` is the 8-bit XOR checksum (hex) over the payload between `$` and `*`.
 - Missing fields (e.g. a fan RPM that can't be read) are sent as `-1`; the firmware treats
