@@ -14,6 +14,7 @@
 #include "nt7534/u8g2_port.h"     /* u8g2 移植层: 真 ° 字形 + 线段/矩形/圆 */
 #include "nt7534/fan_frames.h"    /* 3 叶 20x20 风扇位图帧(24 帧, scripts/gen_fan_frames.py 生成) */
 #include "nt7534/dino_frames.h"   /* 离线恐龙 2 帧 + 仙人掌, scripts/gen_dino_frames.py 生成 */
+#include "trng/ra6e2_trng.h"      /* 片上 TRNG 可复用驱动（裸寄存器，不依赖 r_sce） */
 #include "oled/bsp_oled.h"             /* 1.3" OLED 兼作"第二指示灯" */
 #include "rtt/rtt_log.h"
 #include "uart/bsp_uart_link.h"        /* 上位机数据（SCI0 / USB CDC 共用解析） */
@@ -293,56 +294,10 @@ static int32_t  s_cloud_pos[DINO_CLOUD_CNT]  = { 2600, 8200 };  /* 1/100 px: 26.
 static uint8_t  s_cloud_kind[DINO_CLOUD_CNT] = { 0u, 2u };      /* 云尺寸档位(0..CLOUD_N-1) */
 static uint8_t  s_cloud_y[DINO_CLOUD_CNT]    = { 2u, 8u };      /* 云顶部 y(0..18-h) */
 static uint32_t s_dino_rng          = 0x12345678u;    /* xorshift32 状态 */
+volatile uint32_t g_dino_trng_dbg = 0u;   /* 调试: 最近一次 TRNG 读值(0 = 超时/失败), 由 trng_last_value() 同步, 供 probe-rs 读 RAM 验证 */
 
-/* ---- 片上 TRNG（RA6E2 硬件有 TRNG，FSP 6.6 无 r_trng 驱动 ⇒ 裸寄存器）----
- * R_TRNG @0x40162000: +0x00 TRNGSDR(SEED 数据), +0x02 TRNGSCR0(bit2 SGSTART / bit3 SGCEN / bit7 RDRDY),
- *   +0x03 TRNGSCR1(bit0 INTEN)。
- * RDRDY=1 表示 32 位 SEED 就绪；连读 TRNGSDR 4 次取完整 32 位，读完后 RDRDY 自动清 0。
- * 模块启停照 FSP system.c: 先解锁 LPC 寄存器保护再 R_BSP_MODULE_START，用完再 stop。
- * ⚠ 全程带超时，绝不无限阻塞；失败返回 0，由调用方回落到 g_ms_tick 抖动。 */
-#define DINO_TRNG_SDR   (*(volatile uint8_t *) 0x40162000UL)
-#define DINO_TRNG_SCR0  (*(volatile uint8_t *) 0x40162002UL)
-#define DINO_TRNG_SCR1  (*(volatile uint8_t *) 0x40162003UL)
-
-volatile uint32_t g_dino_trng_dbg = 0u;   /* 调试: 最近一次 TRNG 读值(0 = 超时/失败, 可用 probe-rs 读 RAM 验证) */
-
-static uint32_t dino_trng_u32(void)
-{
-    uint32_t guard;
-    uint32_t v;
-
-    R_BSP_RegisterProtectDisable(BSP_REG_PROTECT_OM_LPC_BATT);
-    R_BSP_MODULE_START(FSP_IP_TRNG, 0);
-    R_BSP_RegisterProtectEnable(BSP_REG_PROTECT_OM_LPC_BATT);
-
-    DINO_TRNG_SCR1 = 0x00u;                                   /* 关 TRNG 中断 */
-    DINO_TRNG_SCR0 = (uint8_t)(DINO_TRNG_SCR0 | (1u << 3));   /* SGCEN=1: 使能 SEED 生成电路 */
-
-    /* SGCEN 置位后至少等 3 个 TRNGCLK(手册), 用几次 volatile 读留足余量 */
-    (void) DINO_TRNG_SCR0; (void) DINO_TRNG_SCR0; (void) DINO_TRNG_SCR0; (void) DINO_TRNG_SCR0;
-
-    DINO_TRNG_SCR0 = (uint8_t)(DINO_TRNG_SCR0 | (1u << 2));   /* SGSTART=1: 启动一次生成 */
-
-    for (guard = 0u; guard < 500000u; guard++)                /* 等 RDRDY=1, 带超时 */
-    {
-        if ((DINO_TRNG_SCR0 & 0x80u) != 0u) { break; }
-    }
-    if ((DINO_TRNG_SCR0 & 0x80u) == 0u)
-    {
-        DINO_TRNG_SCR0 = (uint8_t)(DINO_TRNG_SCR0 & ~(1u << 3));
-        g_dino_trng_dbg = 0u;
-        return 0u;                                            /* 超时: 调用方回落 */
-    }
-
-    v  =  (uint32_t) DINO_TRNG_SDR;
-    v |= ((uint32_t) DINO_TRNG_SDR) << 8;
-    v |= ((uint32_t) DINO_TRNG_SDR) << 16;
-    v |= ((uint32_t) DINO_TRNG_SDR) << 24;
-
-    DINO_TRNG_SCR0 = (uint8_t)(DINO_TRNG_SCR0 & ~(1u << 3));  /* 关电路省电 */
-    g_dino_trng_dbg = v;
-    return v;
-}
+/* 片上 TRNG 已抽成独立可复用驱动: src/trng/ra6e2_trng.{h,c}
+ * 这里只调用 trng_u32() 播种，不再内联寄存器操作（避免重复与维护分叉）。 */
 
 /* 轻量 PRNG（无 libm 依赖） */
 static uint32_t dino_rand_u32(void)
@@ -361,8 +316,16 @@ static void dino_init(void)
 {
     /* 用片上 TRNG 播种; TRNG 超时/失败则回落 g_ms_tick 抖动, 保证种子非空 */
     {
-        uint32_t trng = dino_trng_u32();
-        s_dino_rng = (trng != 0u) ? (trng | 1u) : ((0x12345678u ^ g_ms_tick) | 1u);
+        uint32_t trng = 0u;
+        if (trng_u32(&trng))
+        {
+            s_dino_rng = trng | 1u;
+        }
+        else
+        {
+            s_dino_rng = (0x12345678u ^ g_ms_tick) | 1u;
+        }
+        g_dino_trng_dbg = trng_last_value();   /* 调试: probe-rs 读 RAM 验证 */
     }
     s_dino_jump_t    = 0u;
     s_dino_jump_h    = DINO_JUMP_H_MIN;
