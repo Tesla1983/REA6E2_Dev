@@ -78,7 +78,7 @@
 extern volatile uint32_t g_nt_fw_tag;
 
 /** 与 `g_nt_fw_tag` 对应的期望值（"NT" + 版本号）。改代码时同步 +1。 */
-#define NT7534_FW_TAG   (0x4E54001Au)
+#define NT7534_FW_TAG   (0x4E54001Bu)
 
 /** 版本号字节 —— 从 `NT7534_FW_TAG` 低 8 位取。
  *  起因: v6 -> v7 时屏上状态行是硬编码字符串, 改版忘了改 ⇒ 探针读到 0x4E540007、
