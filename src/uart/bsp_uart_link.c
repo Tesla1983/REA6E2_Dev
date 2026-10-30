@@ -6,6 +6,7 @@
 #include "uart/bsp_uart_link.h"
 
 #include "rtt/rtt_log.h"
+#include "trng/ra6e2_trng.h"        /* 片上真随机: $RND 指令的数据源 */
 #include "usb/bsp_usb_cdc.h"        /* USB_CDC_Write: 身份应答走 Type-C 回 */
 
 /* 固件版本魔数（在 nt7534.c 里写入, 这里只读低 8 位）。
@@ -285,6 +286,77 @@ static void link_send_identity(void)
     g_link_tx_cnt++;
 }
 
+/* ============================================================
+ * 真随机数应答（`$RND,<n>`）—— 板子作为硬件 TRNG 源
+ *
+ * 设计: 板子只负责"按请求返回 n 字节真随机", 不解释随机数的语义(轮/线/赔付都由上位机定)。
+ * 老虎机/任意需要真随机的上位机应用都走这个指令, 与现有性能监视系统的数据流完全解耦。
+ *
+ * 请求:  `$RND,<n>*XX`     (n = 十进制字节数, 1..RND_MAX_BYTES)
+ * 应答:  `$RND:<2n hex>*XX` (成功, 每字节两位大写十六进制)
+ *        `$RND:E*XX`        (TRNG 失败, 让上位机知道本次不可用、自行回落)
+ * ============================================================ */
+
+#define RND_MAX_BYTES   (64u)   /* 单次最多取 64 字节: 防滥用 + 缓冲上限 */
+
+/** 回 n 字节真随机（hex 编码）。优先 USB CDC, 失败退 SCI0, 与 link_send_identity 同构。 */
+static void link_send_random(uint16_t n)
+{
+    /* 必须 static: FSP 的 write 是异步的, 缓冲不能在栈上 */
+    static char    s_frame_usb[8u + (RND_MAX_BYTES * 2u) + 8u];
+    static uint8_t s_frame_uart[8u + (RND_MAX_BYTES * 2u) + 8u];
+    static uint8_t s_rnd[RND_MAX_BYTES];
+    uint8_t  x = 0u;
+    uint16_t k = 0u;
+    uint16_t j;
+    bool     ok = trng_bytes(s_rnd, (size_t) n);
+
+    s_frame_usb[k++] = '$';
+    s_frame_usb[k++] = 'R'; s_frame_usb[k++] = 'N'; s_frame_usb[k++] = 'D';
+    s_frame_usb[k++] = ':';
+
+    if (ok)
+    {
+        for (j = 0u; j < n; j++)
+        {
+            uint8_t b = s_rnd[j];
+            uint8_t h = (uint8_t) ((b >> 4) & 0x0Fu);
+            uint8_t l = (uint8_t) (b & 0x0Fu);
+            s_frame_usb[k++] = (char) ((h < 10u) ? ('0' + h) : ('A' + h - 10));
+            s_frame_usb[k++] = (char) ((l < 10u) ? ('0' + l) : ('A' + l - 10));
+        }
+    }
+    else
+    {
+        s_frame_usb[k++] = 'E';                   /* TRNG 失败标记 */
+    }
+
+    /* XOR 覆盖 '$' 之后到 '*' 之前（与数据帧一致） */
+    for (j = 1u; j < k; j++)
+    {
+        x ^= (uint8_t) s_frame_usb[j];
+    }
+    s_frame_usb[k++] = '*';
+    {
+        uint8_t hi = (uint8_t) ((x >> 4) & 0x0Fu);
+        uint8_t lo = (uint8_t) (x & 0x0Fu);
+        s_frame_usb[k++] = (char) ((hi < 10u) ? ('0' + hi) : ('A' + hi - 10));
+        s_frame_usb[k++] = (char) ((lo < 10u) ? ('0' + lo) : ('A' + lo - 10));
+    }
+    s_frame_usb[k++] = '\r';
+    s_frame_usb[k++] = '\n';
+
+    if (FSP_SUCCESS != USB_CDC_Write((uint8_t const *) s_frame_usb, k))
+    {
+        for (j = 0u; j < k; j++)
+        {
+            s_frame_uart[j] = (uint8_t) s_frame_usb[j];
+        }
+        (void) g_uart0.p_api->write(&g_uart0_ctrl, s_frame_uart, k);
+    }
+    g_link_tx_cnt++;
+}
+
 /** payload 是否正好是 "ID?"（长度 = star-1）。 */
 static bool is_id_query(uint16_t star)
 {
@@ -358,6 +430,34 @@ static bool parse_line(void)
     if (is_id_query(star))
     {
         link_send_identity();
+        return true;
+    }
+
+    /* 真随机数请求: `$RND,<n>*XX` —— 板子作硬件 TRNG 源, 回 n 字节随机(hex)。
+     * 与性能监视数据流无关; 上位机(老虎机等)按需取真随机, 板子不解释语义。 */
+    if ((star >= 6u) &&
+        ('R' == s_line[1]) && ('N' == s_line[2]) && ('D' == s_line[3]) && (',' == s_line[4]))
+    {
+        uint16_t n = 0u;
+        bool     ok = false;
+
+        for (i = 5u; i < star; i++)
+        {
+            uint8_t c = s_line[i];
+            if (('0' <= c) && (c <= '9'))
+            {
+                n = (uint16_t) (n * 10u + (uint16_t) (c - '0'));
+                ok = true;
+            }
+            else
+            {
+                break;
+            }
+        }
+        if (ok && (n > 0u) && (n <= RND_MAX_BYTES))
+        {
+            link_send_random(n);
+        }
         return true;
     }
 
