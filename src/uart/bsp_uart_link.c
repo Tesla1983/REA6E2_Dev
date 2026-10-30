@@ -13,6 +13,9 @@
  * 用 extern 而不是 include 那个头: 保持 uart 层不依赖 nt7534, 且版本只有一处真值。 */
 extern volatile uint32_t g_nt_fw_tag;
 
+/* 1 ms 系统心跳（SysTick_Handler 递增），用于流式限速的间隔门控。 */
+extern volatile uint32_t g_ms_tick;
+
 /* ---------------- 运行统计 ---------------- */
 
 volatile uint32_t g_link_frames    = 0u;
@@ -357,6 +360,87 @@ static void link_send_random(uint16_t n)
     g_link_tx_cnt++;
 }
 
+/* ============================================================
+ * 流式真随机输出（`$RNDS,<n>`）—— 高吞吐模式, 用于分布分析/大批量采样
+ *
+ * 与 $RND,<n> 查询-响应不同: 开启后板子直接往 USB CDC 吐裸随机字节流(无 $ 帧结构),
+ * 直到发够 n 字节(n>0 有限流) 或收到 $RNDX(n=0 无限流时由上位机停)。
+ * 上位机发 $RNDS 后立刻切读模式收集; 板子不回任何帧(否则会污染字节流)。
+ * 每笔经 USB_CDC_Write 异步发送, 必须等上一笔完成(USB_CDC_TxReady)再写下一批,
+ * 否则覆盖 s_tx_stage 缓冲。主循环 2ms 细片每轮调一次 UART_Link_Stream_Pump()。
+ * ============================================================ */
+static bool     s_stream_active = false;   /* 是否处于流式输出 */
+static uint32_t s_stream_rem    = 0u;     /* 剩余待发字节(0 = 无限流) */
+static uint32_t s_stream_sent   = 0u;     /* 已发字节(调试/自检) */
+static uint32_t s_last_send_ms  = 0u;     /* 上一笔发出的时刻(g_ms_tick)，限速门控用 */
+
+/* 每笔字节数。⚠ 必须是 64(FS 批量端点 wMaxPacketSize)的**非整数倍**:
+ * FSP 的 R_USB_Write(256) 会发出 4×64 满包, 传输没有短包收尾; Windows USBD 把 IN 流按 64KB
+ * 窗口聚合, 一个没有短包/ ZLP 收尾的 64KB 窗口无法判定"本窗结束", 于是连续发满 3 窗
+ * (=196608 字节)后主机传输窗口卡死、不再投递(实测稳停在 196608/200000)。
+ * 改成 255(=3×64+63)后每笔都以 63 字节短包收尾, USBD 每笔都能干净结束, 卡死消失。
+ * 仍 ≤ USB_CDC_TX_STAGE(256), 缓冲安全。 */
+#define STREAM_CHUNK   (255u)
+
+/* 流式限速（无流控 CDC 必需）：两次发送之间至少间隔的毫秒数。
+ * 依据：主机 pyserial 实测稳定接收约 37 KB/s；板子若不限速会以 ~100 KB/s 狂发，
+ * 淹没主机 RX 缓冲造成丢字节（实测 200000 字节只收到 196608 且尾部停滞）。
+ * 这里压到 ~16 KB/s（256B/16ms）留足余量；可用探针改 g_stream_interval_ms 现场调。 */
+volatile uint32_t g_stream_interval_ms = 16u;
+
+void UART_Link_Stream_Pump(void)
+{
+    static uint8_t s_chunk[STREAM_CHUNK];
+    uint32_t       chunk;
+
+    if (!s_stream_active)
+    {
+        return;
+    }
+    if (!USB_CDC_Configured())
+    {
+        s_stream_active = false;          /* 断链: 流式无意义 */
+        return;
+    }
+    if (!USB_CDC_TxReady())
+    {
+        return;                          /* 上一笔还在传, 等下轮 */
+    }
+
+    /* 限速门控：无流控的 CDC 设备发太快会淹没主机接收缓冲导致丢字节。
+     * 用 1ms 心跳做间隔判断，把速率压到主机能稳稳消化的水平。 */
+    if ((g_ms_tick - s_last_send_ms) < g_stream_interval_ms)
+    {
+        return;
+    }
+
+    chunk = STREAM_CHUNK;
+    if ((0u != s_stream_rem) && ((s_stream_rem - s_stream_sent) < chunk))
+    {
+        chunk = s_stream_rem - s_stream_sent;   /* 最后一笔不足 256 时只发余量 */
+    }
+    if (0u == chunk)
+    {
+        s_stream_active = false;
+        return;
+    }
+
+    if (trng_bytes(s_chunk, (size_t) chunk))
+    {
+        if (FSP_SUCCESS == USB_CDC_Write(s_chunk, chunk))
+        {
+            s_stream_sent += chunk;
+            s_last_send_ms = g_ms_tick;        /* 记下时刻, 下一笔受限速门控约束 */
+            if ((0u != s_stream_rem) && (s_stream_sent >= s_stream_rem))
+            {
+                s_stream_active = false;        /* 有限流达成 */
+            }
+        }
+        /* 写失败(busy/未枚举): 不推进 sent, 下轮重试(重新生成, 都是真随机) */
+    }
+    /* TRNG 失败: 跳过本轮, 不推进 sent */
+}
+
 /** payload 是否正好是 "ID?"（长度 = star-1）。 */
 static bool is_id_query(uint16_t star)
 {
@@ -459,6 +543,48 @@ static bool parse_line(void)
             link_send_random(n);
         }
         return true;
+    }
+
+    /* 流式真随机: `$RNDS,<n>*XX` 开启(n=0 无限流; n>0 有限流 n 字节); `$RNDX*XX` 停止。
+     * 开启后板子直接吐裸随机字节流, 不回帧。 */
+    if ((star >= 5u) &&
+        ('R' == s_line[1]) && ('N' == s_line[2]) && ('D' == s_line[3]))
+    {
+        if (('X' == s_line[4]) && (star == 5u))          /* $RNDX: 停止 */
+        {
+            s_stream_active = false;
+            return true;
+        }
+        if (('S' == s_line[4]) && (star >= 7u) && (',' == s_line[5]))   /* $RNDS,<n> */
+        {
+            uint32_t n = 0u;
+            bool     ok2 = false;
+            uint16_t k;
+            for (k = 6u; k < star; k++)
+            {
+                uint8_t c = s_line[k];
+                if (('0' <= c) && (c <= '9'))
+                {
+                    if (n <= (0xFFFFFFFFu / 10u))
+                    {
+                        n = n * 10u + (uint32_t) (c - '0');
+                        ok2 = true;
+                    }
+                }
+                else
+                {
+                    break;
+                }
+            }
+            if (ok2)
+            {
+                s_stream_rem    = n;     /* 0 = 无限流 */
+                s_stream_sent   = 0u;
+                s_last_send_ms  = 0u;   /* 让首笔立即发出, 不受限速门控延迟 */
+                s_stream_active = true;
+            }
+            return true;
+        }
     }
 
     /* 逐段解析 KEY:VALUE, 段之间用 ',' 分隔 */

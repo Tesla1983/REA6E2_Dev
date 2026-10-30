@@ -32,6 +32,10 @@ bool USB_CDC_Configured(void);
  *  ⚠ buf 指向的内容必须在完成回调前保持有效 —— 内部已做一份拷贝，可直接传栈上缓冲。 */
 fsp_err_t USB_CDC_Write(uint8_t const * p_src, uint32_t len);
 
+/** 数据管道是否可写: 上一笔异步传输已完成且 PC 已枚举。
+ *  流式输出用它避免在传输中覆盖发送缓冲(s_tx_stage)。 */
+bool USB_CDC_TxReady(void);
+
 extern volatile uint32_t g_usb_open_err;   /**< R_USB_Open 的返回码（0 = FSP_SUCCESS） */
 extern volatile uint32_t g_usb_events;     /**< 回调被调用的次数（不涨 = 中断没进来） */
 extern volatile uint32_t g_usb_rx_bytes;   /**< 从 PC 收到的字节数 */

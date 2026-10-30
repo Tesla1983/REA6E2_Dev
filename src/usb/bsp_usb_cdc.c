@@ -947,5 +947,18 @@ fsp_err_t USB_CDC_Write(uint8_t const * p_src, uint32_t len)
 
     g_usb_tx_bytes += len;
 
-    return R_USB_Write(&g_basic0_ctrl, s_tx_stage, len, USB_CLASS_PCDC);
+    fsp_err_t e = R_USB_Write(&g_basic0_ctrl, s_tx_stage, len, USB_CLASS_PCDC);
+    if (FSP_SUCCESS == e)
+    {
+        /* 标记数据管道忙: 上一笔异步传输未完成前不得再写(否则覆盖 s_tx_stage 缓冲)。
+         * 写完成回调(USB_STATUS_WRITE_COMPLETE)会清 s_serial_busy。
+         * 流式输出用 USB_CDC_TxReady() 据此判断, 避免传输中覆盖发送缓冲。 */
+        s_serial_busy = true;
+    }
+    return e;
+}
+
+bool USB_CDC_TxReady(void)
+{
+    return ((false == s_serial_busy) && (true == s_configured));
 }

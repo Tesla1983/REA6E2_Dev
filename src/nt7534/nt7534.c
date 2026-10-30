@@ -1170,6 +1170,7 @@ void NT7534_Run(void)
             R_BSP_SoftwareDelay(2u, BSP_DELAY_UNITS_MILLISECONDS);
             uint32_t cyc_wd = DWT_CYCCNT_REG;/* 空转结束时刻的周期计数: 此后才计为"干活"(空转不计入) */
             USB_CDC_Poll();
+            UART_Link_Stream_Pump();         /* 流式真随机: 上一笔发完(TxReady)则再吐一笔裸字节 */
 #if (NT7534_BUS_MODE == 2)
             /* 推进 S3 异步分页刷新状态机(每 2ms 一轮, 8 页 ~11ms 内发完) */
             NT7534_Pump_Poll();

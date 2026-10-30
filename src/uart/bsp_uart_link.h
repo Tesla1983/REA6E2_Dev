@@ -46,6 +46,10 @@ extern volatile uint32_t g_link_tx_cnt;    /* beacon 已发起次数 */
  *  由上位机数据行的 `LG` 字段下发；默认 1（中文）。 */
 extern volatile uint8_t  g_screen_lang;
 
+/** 流式限速（无流控 CDC 必需）：两次发送之间至少间隔的毫秒数。
+ *  默认 16（≈16 KB/s），压到主机能稳稳消化的水平；可用探针改 RAM 现场调。 */
+extern volatile uint32_t g_stream_interval_ms;
+
 /** 打开 SCI0 并挂上单字节接收。返回 FSP_SUCCESS 表示成功。 */
 fsp_err_t UART_Link_Init(void);
 
@@ -59,6 +63,10 @@ void UART_Link_PushBytes(uint8_t const * p_src, uint32_t n);
 
 /** 主循环里调用: 把环形缓冲里已到的字节喂给解析器。**不阻塞**。 */
 void UART_Link_Poll(void);
+
+/** 主循环 2ms 细片里每轮调用: 流式真随机输出($RNDS 开启后往 USB CDC 吐裸字节流)。
+ *  上一笔异步发送未完成(USB_CDC_TxReady=false)时自动跳过, 不阻塞。 */
+void UART_Link_Stream_Pump(void);
 
 /** 主循环里周期性调用（建议每 250 ms 一次, 传 250）。
  *  实现接收超时: 连续 2 s 没有有效帧就判为断链，屏幕上显示 `NO LINK`。 */
